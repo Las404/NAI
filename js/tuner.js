@@ -4,8 +4,9 @@ import { state, emit, NEG_BLOCKS } from './state.js';
 import { fmtWeight } from './prompt.js';
 import { MODELS, SAMPLERS, stepRange, clampSteps } from './nai.js';
 import { imageStats, statSim, describeStats } from './imgstats.js';
-import { splitPrompt, hasTag } from './tagtext.js';
+import { splitPrompt, hasTag, removeTag } from './tagtext.js';
 import { loadArtists } from './artists.js';
+import { tagImage, loadTagger, cosineSim } from './wdtagger.js';
 import { generateRaw } from './generator.js';
 import { usage, summarize } from './usage.js';
 import { history } from './store.js';
@@ -143,7 +144,12 @@ export function scoreOf(run, cand) {
   const avg = (k) => { const xs = cand.images.map((i) => i[k]).filter((x) => x != null); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null; };
   const n01 = (v, [lo, hi]) => (v == null || hi <= lo ? 0.5 : (v - lo) / (hi - lo));
   const clip = avg('clip'), stat = avg('stat');
-  const match = 0.6 * n01(clip, range('clip')) + 0.4 * n01(stat, range('stat'));
+  const wd = avg('wd'), wtag = avg('wtag');
+  // 애니 태거가 있으면: 화풍 태그 일치 40% + CLIP 30% + 색감·선 15% + WD 임베딩 15%
+  // (nax.moe 샘플로 검증: 같은 작가를 81장 중 1위로 고른 횟수 40번 중 17 → 20, 10위 안 33 → 36)
+  const match = wd != null
+    ? 0.4 * n01(wtag, range('wtag')) + 0.3 * n01(clip, range('clip')) + 0.15 * n01(stat, range('stat')) + 0.15 * n01(wd, range('wd'))
+    : 0.6 * n01(clip, range('clip')) + 0.4 * n01(stat, range('stat'));
   // 👍 보너스: 나중 라운드에서 고른 것일수록 조금 더 (앞선 👍를 다듬은 결과라서)
   if (run.brain === 'clip') return { total: match + (cand.picked ? 1 + 0.03 * cand.round : 0), clip, stat, match };
   const cl = cand.claude == null ? null : cand.claude / 10;
@@ -231,15 +237,19 @@ async function analyze(run) {
   const bmp = await createImageBitmap(run.refBlob);
   [run.width, run.height] = sizeFor(bmp.width, bmp.height);
   run.refVec = await embedStyle(run.refBlob);
-  run.refStats = await imageStats(run.refBlob);
+  const ref = await analyzeReference(run.refBlob);
+  run.refStats = ref.stats;
+  run.refWd = ref.wd;
   const groups = await loadStyleGroups();
   const res = await analyzeImage(run.refBlob, { exclude: state.hidden, groups });
+  res.artists = ref.artists;
   const top = res.artists.slice(0, 40);
   const best = top[0]?.sim || 1;
   run.clipHints = 'CLIP artist candidates (similarity of each artist\'s NovelAI V5 sample render to the reference, 100 = best match):\n'
     + top.map((a) => `artist:${a.tag} (${Math.round((a.sim / best) * 100)})`).join(', ')
     + '\n\nCLIP style-tag hints (z-score within group, higher = more prominent):\n'
     + Object.entries(res.styles).map(([g, list]) => `${g}: ` + list.slice(0, 5).map((s) => `${s.tag} (${s.score.toFixed(1)})`).join(', ')).join('\n')
+    + (ref.source === 'wd' ? `\n\nWD Tagger v3 (anime Danbooru tagger) tags of the reference — CONTENT: ${ref.content}\nSTYLE: ${ref.hintDetail.map((d) => `${d.tag} (${d.score.toFixed(2)})`).join(', ')}` : '')
     + `\n\nMeasured color/line stats of the reference: ${describeStats(run.refStats).join(', ') || 'average'} (mean saturation ${run.refStats.meanS.toFixed(2)}, value contrast ${run.refStats.stdV.toFixed(2)}, edge density ${run.refStats.edgeD.toFixed(2)})`
     + (run.pickedArtists.length ? `\n\nThe USER looked at sample renders and picked these artists as closest to the reference — build combinations mainly from them: ${run.pickedArtists.map((t) => 'artist:' + t).join(', ')}` : '')
     + `\nAlways combine 2-4 artists (more artists tends to look worse), weights 0.3-1.0; never test a single artist alone. On V5 models never use any weight above 1.0 (it becomes too strong); on V4.5 keep weights within 1.3.`
@@ -299,10 +309,15 @@ async function renderCands(run, cands, seedOf) {
       }
     }
     run.used++;
-    const clip = cosine(run.refVec, await embedStyle(item.blob));
-    const stat = statSim(run.refStats, await imageStats(item.blob));
-    c.images.push({ itemId: item.id, seed, clip, stat, blob: item.blob, url: URL.createObjectURL(item.blob) });
-    log(`${c.id} 생성 (${run.used}/${run.budget}) · CLIP ${clip.toFixed(3)} · 색감 ${stat.toFixed(3)}`);
+    try {
+      const clip = cosine(run.refVec, await embedStyle(item.blob));
+      const stat = statSim(run.refStats, await imageStats(item.blob));
+      const w = await wdCompare(run, item.blob);
+      c.images.push({ itemId: item.id, seed, clip, stat, ...w, blob: item.blob, url: URL.createObjectURL(item.blob) });
+      log(`${c.id} 생성 (${run.used}/${run.budget}) · CLIP ${clip.toFixed(3)} · 색감 ${stat.toFixed(3)}${w.wtag != null ? ` · 화풍 태그 차이 ${(-w.wtag).toFixed(2)}` : ''}`);
+    } catch (e) {
+      log(`${c.id} 이미지 분석 실패 (점수 없이 넘어가요): ${e.message}`, 'bad');
+    }
     await item.usageDone;
     checkLimits(run);
     if (run.used < run.budget && !run.stopping) {
@@ -459,18 +474,54 @@ export { ClaudeError };
 let contentGroupsPromise;
 const loadContentGroups = () => (contentGroupsPromise ||= fetch(new URL('../assets/content-tags.json', import.meta.url)).then((r) => r.json()).then((j) => j.groups));
 
-// 예시 이미지 분석 (시작 전에 미리 볼 수 있게 export): 내용 프롬프트 추정 + 작가 후보 + 화풍 힌트 + 색감 통계
-export async function analyzeReference(blob) {
-  const [styleGroups, contentGroups] = await Promise.all([loadStyleGroups(), loadContentGroups()]);
-  const [res, stats] = await Promise.all([
+// 화풍으로 볼 Danbooru 태그 (태그 사전 + 자주 나오는 채색·선·효과 태그)
+const STYLE_EXTRA = ['anime coloring', 'flat color', 'cel shading', 'lineart', 'sketch', 'realistic', 'photorealistic', 'monochrome', 'greyscale', 'spot color',
+  'limited palette', 'pastel colors', 'muted color', 'high contrast', 'colorful', 'gradient', 'watercolor (medium)', 'traditional media', 'oil painting (medium)',
+  'official art', 'game cg', 'chromatic aberration', 'blurry', 'blurry background', 'blurry foreground', 'depth of field', 'bloom', 'light particles', 'lens flare',
+  'sparkle', 'film grain', 'shiny skin', 'shiny hair', 'glint', 'backlighting', 'rim light', 'dithering', 'halftone', 'scanlines', '3d', 'pixel art', 'retro artstyle',
+  '1990s (style)', '1980s (style)', '2000s (style)', 'oekaki', 'thick outlines', 'no lineart', 'colored lineart', 'partially colored', 'glowing', 'light rays', 'sunbeam',
+  'dappled sunlight', 'vignetting', 'soft focus', 'cinematic lighting', 'dramatic lighting', 'dark', 'sepia', 'hatching (texture)', 'screentone', 'painterly',
+  'impasto', 'faux traditional media', 'ink (medium)', 'marker (medium)', 'pencil (medium)', 'graphite (medium)', 'colored pencil (medium)', 'acrylic paint (medium)', 'chibi'];
+// 내용 프롬프트에 넣지 않을 메타 태그
+const META_TAGS = new Set(['artist name', 'signature', 'watermark', 'text', 'english text', 'japanese text', 'chinese text', 'korean text', 'web address', 'dated',
+  'twitter username', 'patreon username', 'pixiv username', 'copyright name', 'character name', 'logo', 'commentary', 'commentary request', 'translated',
+  'speech bubble', 'border', 'letterboxed', 'pillarboxed', 'artist logo', 'company name', 'watermark', 'virtual youtuber']);
+let styleSetPromise;
+const loadStyleSet = () => (styleSetPromise ||= loadStyleGroups().then((gs) => new Set([...gs.flatMap((g) => g.tags.map(([t]) => nrm(t))), ...STYLE_EXTRA])));
+
+// 예시 이미지 분석 (시작 전에 미리 볼 수 있게 export)
+//  - WD 태거(애니 전용): 내용 프롬프트(인물·옷·구도·배경) + 화풍 태그 + 비교용 임베딩
+//  - CLIP: 비슷한 작가 후보 (WD 작가 색인이 있으면 둘을 합침), WD를 못 쓰면 예전처럼 CLIP으로 추정
+//  - 색감 통계
+export async function analyzeReference(blob, onProgress = () => {}) {
+  const [styleGroups, contentGroups, styleSet] = await Promise.all([loadStyleGroups(), loadContentGroups(), loadStyleSet()]);
+  const [res, stats, wd] = await Promise.all([
     analyzeImage(blob, { exclude: state.hidden, groups: [...styleGroups, ...contentGroups] }),
     imageStats(blob),
+    tagImage(blob).catch((e) => { console.warn('WD tagger', e); onProgress('애니 태거를 못 써서 CLIP으로 추정해요: ' + e.message); return null; }),
   ]);
+  // 작가 후보는 CLIP (WD 임베딩은 그림 내용에 끌려서 작가 찾기 검증에서 CLIP보다 훨씬 못했음)
+  const artists = res.artists;
+  if (wd) {
+    const { labels } = await loadTagger();
+    const styleTags = wd.general.filter((g) => styleSet.has(nrm(g.tag)) && !META_TAGS.has(g.tag));
+    const contentTags = [...wd.characters, ...wd.general.filter((g) => !styleSet.has(nrm(g.tag)) && !META_TAGS.has(g.tag))].slice(0, 40);
+    const styleIdx = [];
+    labels.forEach((l, i) => { if (l.cat === 0 && styleSet.has(nrm(l.tag))) styleIdx.push(i); });
+    return {
+      content: contentTags.map((g) => g.tag).join(', '),
+      artists,
+      styleHints: styleTags.map((g) => g.tag),
+      hintDetail: styleTags.map((g) => ({ tag: g.tag, group: 'wd', score: g.p })),
+      refTags: wd.general.map((g) => g.tag),
+      wd: { embed: wd.embed, probs: wd.probs, styleIdx },
+      stats, statWords: describeStats(stats), source: 'wd',
+    };
+  }
   const content = [];
   for (const g of contentGroups) {
     const list = res.styles[g.id];
     if (!list?.length) continue;
-    // CLIP 추정은 틀릴 수 있어서, 확실히 두드러질 때만 넣음 (틀린 태그보다 빠진 태그가 나음)
     const need = g.id === 'c_frame' ? 1.2 : ['c_clothes', 'c_bg'].includes(g.id) ? 2.1 : 1.6;
     for (const s of list.slice(0, g.pick)) if (s.score > need) content.push(s.tag);
   }
@@ -484,9 +535,24 @@ export async function analyzeReference(blob) {
       hintDetail.push({ tag: s.tag, group: g.id, score: s.score });
     }
   }
-  return { content: content.join(', '), artists: res.artists, styleHints, hintDetail, stats, statWords: describeStats(stats) };
+  return { content: content.join(', '), artists, styleHints, hintDetail, refTags: [], wd: null, stats, statWords: describeStats(stats), source: 'clip' };
 }
 
+// 생성 이미지 ↔ 예시: WD 임베딩 유사도 + 화풍 태그 확률이 얼마나 같은지
+async function wdCompare(run, blob) {
+  if (!run.refWd) return {};
+  try {
+    const r = await tagImage(blob);
+    const a = run.refWd.probs, b = r.probs;
+    // 화풍 태그 확률 차이의 합 (작을수록 비슷) — 문턱값을 두면 동점이 많아져서 전부 더함
+    let diff = 0;
+    for (const i of run.refWd.styleIdx) diff += Math.abs(a[i] - b[i]);
+    return { wd: cosineSim(run.refWd.embed, r.embed), wtag: -diff };
+  } catch (e) {
+    console.warn('WD compare', e);
+    return {};
+  }
+}
 // CLIP이 자주 헛짚는 태그: 자동으로는 절대 안 넣음
 const NEVER_AUTO = new Set(['ai-generated', 'abstract', 'color trace', 'calligraphy brush (medium)', 'unconventional media', 'mixed media', 'motion lines', 'motion blur', 'glitch', 'multiple views', 'photo (medium)', 'jpeg artifacts']);
 // 처음부터 넣어도 되는 분류 (나머지 힌트는 ③ 단계에서 넣어보고 점수로 판단)
@@ -522,7 +588,7 @@ function specToCand(spec, id, round, rationale) {
 const specKey = (s) => JSON.stringify([s.artists.map((a) => [a.tag, a.w]).sort(), s.tags.map((t) => [t.tag, t.w]).sort(), s.extra, s.quality, s.negative, s.scale, s.cfg_rescale, s.steps, s.sampler]);
 
 // 예시 특징에 맞춘 넉넉한 부정 프롬프트
-function buildNegative(stats, hints) {
+function buildNegative(stats, hints, refTags = []) {
   const b = NEG_BLOCKS;
   const has = (re) => hints.some((t) => re.test(t));
   const parts = [b.base, b.anatomy, b.eyes];
@@ -531,7 +597,10 @@ function buildNegative(stats, hints) {
   if (!has(/realistic|3d|photo/)) parts.push(b.real);
   if (!has(/sketch|traditional|watercolor|painterly|pencil|oekaki/)) parts.push(b.rough);
   parts.push(b.chibi, b.old);
-  return parts.join(', ');
+  // 예시에 실제로 있는 특징은 네거티브에서 뺌 (예: 예시가 흑백이면 monochrome을 막지 않음)
+  let neg = parts.join(', ');
+  for (const t of refTags) if (hasTag(neg, t)) neg = removeTag(neg, t);
+  return neg.replace(/[\s,]+$/, '');
 }
 
 // 예시 특징 → 처음 넣을 화풍 태그
@@ -539,7 +608,12 @@ function startStyleTags(run) {
   const st = run.refStats;
   const out = [];
   const add = (tag, w = 1) => { if (!out.some((t) => nrm(t.tag) === nrm(tag))) out.push({ tag, w }); };
-  for (const d of (run.hintDetail || []).filter((x) => START_GROUPS.has(x.group) && x.score > 1.5).slice(0, 3)) add(d.tag);
+  if (run.refWd) {
+    // 애니 태거가 예시에서 확실히 본 화풍 태그 (확률 0.5 이상, 최대 6개)
+    for (const d of (run.hintDetail || []).filter((x) => x.score >= 0.5).slice(0, 6)) add(d.tag);
+  } else {
+    for (const d of (run.hintDetail || []).filter((x) => START_GROUPS.has(x.group) && x.score > 1.5).slice(0, 3)) add(d.tag);
+  }
   if (st.meanS > 0.42) add('vibrant colors');
   else if (st.meanS < 0.2 && st.meanS > 0.1) add('muted color');
   if (st.stdV > 0.29) add('high contrast');
@@ -584,7 +658,10 @@ async function clipAnalyze(run) {
   run.startCombo = topA.slice(0, 3).map((a) => ({ tag: a.tag, w: round2(hiS > loS ? 0.5 + (0.5 * (a.sim - loS)) / (hiS - loS) : 0.7) }));
   run.styleHints = ref.styleHints;
   run.hintDetail = ref.hintDetail;
-  run.analysis = `비슷한 작가 (CLIP): ${run.artistPool.slice(0, 8).join(', ')} …\n두드러진 화풍 (CLIP): ${ref.styleHints.join(', ') || '없음'}\n색감·선: ${ref.statWords.join(', ') || '보통'} (채도 ${ref.stats.meanS.toFixed(2)} · 대비 ${ref.stats.stdV.toFixed(2)} · 윤곽 ${ref.stats.edgeD.toFixed(2)})`;
+  run.refWd = ref.wd;
+  run.refTags = ref.refTags || [];
+  const src = ref.source === 'wd' ? '애니 태거' : 'CLIP';
+  run.analysis = `비슷한 작가: ${run.artistPool.slice(0, 8).join(', ')} …\n화풍 태그 (${src}): ${ref.styleHints.join(', ') || '없음'}\n색감·선: ${ref.statWords.join(', ') || '보통'} (채도 ${ref.stats.meanS.toFixed(2)} · 대비 ${ref.stats.stdV.toFixed(2)} · 윤곽 ${ref.stats.edgeD.toFixed(2)})`;
 
   const [lo, hi] = stepRange(run.model);
   const st = run.startSettings || {};
@@ -593,10 +670,10 @@ async function clipAnalyze(run) {
     : { scale: 5, cfg_rescale: 0.1, steps: Math.round((lo + hi) / 2), sampler: 'k_euler_ancestral' };
   if (run.mode === 'current') {
     const parsed = await parseStart(run, run.startPos || '');
-    run.base = { ...parsed, negative: run.startNeg || buildNegative(run.refStats, run.styleHints), ...settings };
+    run.base = { ...parsed, negative: run.startNeg || buildNegative(run.refStats, run.styleHints, run.refTags), ...settings };
     if (!parsed.tags.length) run.base.tags = startStyleTags(run);
   } else {
-    run.base = { artists: [], tags: startStyleTags(run), extra: '', quality: QUALITY_DEFAULT, negative: buildNegative(run.refStats, run.styleHints), ...settings };
+    run.base = { artists: [], tags: startStyleTags(run), extra: '', quality: QUALITY_DEFAULT, negative: buildNegative(run.refStats, run.styleHints, run.refTags), ...settings };
   }
   run.seen = new Set();
   const reserve = run.budget >= 30 ? Math.min(6, Math.floor(run.budget * 0.1)) : 0;

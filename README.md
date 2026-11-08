@@ -22,7 +22,9 @@ NovelAI Diffusion **V5**에서 작가 태그를 섞고 가중치를 조절해 �
 
 ### 자동 튜너 — 무료 CLIP 모드 (기본)
 추가 결제가 없어요. 화면은 **예시 올리기 → 출발점(처음부터 / 지금 프롬프트 다듬기) → 장수(24·48·80·120·200) → 👍 고르기 → 시작**만 있고, 나머지는 ⚙ 고급 설정에 접어뒀어요.
-- **점수(닮음)** = CLIP 그림체 유사도 60% + **색감·명암·선 통계** 40%(채도·밝기·색상 분포, 윤곽선 세기, 대비, 어두운 선 비율). 모든 라운드를 같은 시드로 그려서 서로 비교해요.
+- **애니 전용 태거(WD Tagger v3)**: 예시를 Danbooru 태그로 읽어서 **내용 프롬프트**(인물·옷·구도·배경)와 **화풍 태그**(채색·선·효과 등)를 채우고, 예시에 실제로 있는 특징은 네거티브에서 빼요. 브라우저 안에서 돌고(WebGPU, 장당 0.1~2초), 처음 한 번 모델을 약 380MB 받아 IndexedDB에 저장해요. 못 쓰는 환경이면 예전처럼 CLIP으로 추정해요.
+- **점수(닮음)** = **화풍 태그 일치**(예시와 결과의 화풍 태그 확률 차이) 40% + CLIP 30% + **색감·명암·선 통계** 15% + WD 임베딩 15%. nax.moe 샘플로 검증했을 때(예시 = 작가 A의 다른 그림, 후보 = 같은 내용을 그린 81명) 같은 작가를 1위로 고른 횟수가 40번 중 17 → 20, 10위 안은 33 → 36으로 올랐어요. 모든 라운드를 같은 시드로 그려서 서로 비교해요.
+- **작가 후보**는 CLIP으로 찾아요. WD 임베딩으로도 작가 색인을 만들어 시험했는데, 그림 내용에 끌려서 다른 그림의 같은 작가를 거의 못 찾았어요(5,000명 중 상위 10위 안: CLIP 4/31, WD 0/31).
 - **처음부터 짜도 완성된 프롬프트**가 나와요: 작가(가중치) + 화풍 태그(색감·대비·연도·복잡도 등) + 퀄리티 태그(`masterpiece, best quality, very aesthetic, absurdres, detailed illustration, intricate details`) + 항상 넣을 태그. 네거티브도 예시에 맞춰 품질·인체·눈·흐린 색·흑백·실사·거친 그림·치비·옛날 그림 묶음으로 60~70개 정도 넣고 시작해요.
 - **지금 프롬프트 다듬기**는 생성 페이지 프롬프트를 작가(``artist:`` 없이 쓴 이름도 작가 목록에서 알아봐요) / 화풍 태그 / 기타 / 퀄리티로 나눠서 출발해요.
 1. **예시 분석**: 비슷한 작가 후보, 화풍 힌트(CLIP이 자주 헛짚는 ``ai-generated`` 같은 태그는 자동으로 안 넣어요), 색감 통계, 비교용 **내용 프롬프트**를 뽑아요. 예시를 올리면 바로 분석해서 보여줘요.
@@ -88,6 +90,7 @@ js/claude.js               Claude API 호출 (브라우저, 사용자 키)
 js/stylepicker.js          태그 팔레트 (누르면 프롬프트에 넣고 빼기)
 js/tagtext.js              프롬프트 ↔ 태그 목록, 칩 보기
 js/imgstats.js             색감·명암·선 통계 (튜너 점수)
+js/wdtagger.js             WD Tagger v3 (애니 Danbooru 태거, onnxruntime-web, 브라우저 실행)
 js/pages/tags.js           태그 사전 페이지
 assets/artists.json        작가 목록 + 갤러리별 투표 수
 assets/tags.json           자동완성 태그 (단부루, 사용 횟수 순)
@@ -121,4 +124,5 @@ GitHub Desktop에서 **Commit → Push origin**을 누르면 1~2분 뒤 GitHub P
 - 작가 샘플 이미지와 투표: [NovelAI Tag Experiments (nax.moe)](https://nax.moe) by Zelest, [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). 샘플 이미지는 nax.moe CDN에서 직접 불러와요. CLIP 임베딩은 이 샘플(투표 상위 5,000명)에서 계산했어요.
 - 자동완성 태그: [a1111-sd-webui-tagcomplete](https://github.com/DominikDoom/a1111-sd-webui-tagcomplete) danbooru.csv (MIT)
 - CLIP: [Xenova/clip-vit-base-patch32](https://huggingface.co/Xenova/clip-vit-base-patch32) (OpenAI CLIP, MIT) + [transformers.js](https://github.com/huggingface/transformers.js)
+- 애니 태거: [SmilingWolf/wd-vit-tagger-v3](https://huggingface.co/SmilingWolf/wd-vit-tagger-v3) (Apache-2.0), 임베딩 출력이 있는 ONNX 변환은 [deepghs/wd14_tagger_with_embeddings](https://huggingface.co/deepghs/wd14_tagger_with_embeddings) (Apache-2.0), 실행은 [onnxruntime-web](https://github.com/microsoft/onnxruntime) (MIT). 
 - NovelAI, Anlatan과 관련 없는 개인 프로젝트예요.

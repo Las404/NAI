@@ -10,6 +10,7 @@ import { ensureAck } from '../queueui.js';
 import { queue } from '../queue.js';
 import { prepareAutosave } from '../autosave.js';
 import { promptBlock } from '../tagtext.js';
+import { loadTagger } from '../wdtagger.js';
 
 // 다시 그려도 펼침 상태 유지
 const openState = {};
@@ -101,16 +102,18 @@ async function setRef(file) {
   const url = refUrl = URL.createObjectURL(file);
   $('tuRef').replaceChildren(h('img', { src: url, class: 'tu-ref', onclick: () => openLightbox(url, '예시 이미지') }), h('div', { class: 'note' }, '다른 그림으로 바꾸려면 빈 곳을 누르거나 끌어다 놓기'));
   const info = $('tuRefInfo');
-  info.replaceChildren(h('div', { class: 'note' }, h('span', { class: 'spinner tiny-spin' }), ' 예시 분석 중… (처음엔 CLIP 모델을 받느라 조금 걸려요)'));
+  const msg = h('span', {}, ' 예시 분석 중…');
+  info.replaceChildren(h('div', { class: 'note' }, h('span', { class: 'spinner tiny-spin' }), msg));
+  loadTagger((m) => { msg.textContent = ' ' + m; }).catch(() => {});
   try {
-    const r = await analyzeReference(file);
+    const r = await analyzeReference(file, (m) => { msg.textContent = ' ' + m; });
     if (refBlob !== file) return;
     refInfo = r;
     opt.content = r.content;
     $('tuContent').value = r.content;
     info.replaceChildren(
       row('비슷한 작가', r.artists.slice(0, 6).map((a) => a.tag).join(', ')),
-      row('화풍', [...r.styleHints, ...r.statWords].join(', ') || '보통'),
+      row(r.source === 'wd' ? '화풍 태그' : '화풍 (CLIP)', [...r.styleHints, ...r.statWords].join(', ') || '보통'),
       row('내용', r.content || '(못 찾음 — 고급 설정에서 적어 주세요)'));
   } catch (e) {
     info.replaceChildren(h('div', { class: 'bad' }, '분석 실패: ' + e.message));
@@ -292,13 +295,13 @@ function intro() {
   return h('div', { class: 'panel tu-intro' },
     h('h3', {}, '이렇게 깎아요'),
     h('ol', { class: 'tu-steps' },
-      h('li', {}, h('b', {}, '예시 분석 '), '— 비슷한 작가 후보, 화풍 태그, 채도·대비·선 굵기를 재요.'),
+      h('li', {}, h('b', {}, '예시 분석 '), '— 애니 전용 태거(WD Tagger v3)로 예시를 Danbooru 태그로 읽어서 내용 프롬프트(인물·옷·구도·배경)와 화풍 태그를 채우고, 비슷한 작가 후보와 채도·대비·선 굵기를 재요. 처음 한 번 모델을 약 380MB 받아요.'),
       h('li', {}, h('b', {}, '조합 · 빼보기 '), '— 분석 상위 작가 5명을 유사도 비례 가중치로 섞어 그리고, 한 명씩 빼보고, 가중치를 바꾸고, 다른 분석 작가로 바꿔봐요. (지금 프롬프트 다듬기는 쓰시던 작가 조합에서 출발)'),
       h('li', {}, h('b', {}, '조합 다듬기 '), '— 제일 닮은 조합에서 가중치 조정·빼기·더하기·바꾸기, 1·2위 섞기를 반복해요.'),
       h('li', {}, h('b', {}, '화풍 태그 '), '— 색감·대비·선·연도·복잡도 태그를 넣고 빼고 세기를 바꿔봐요.'),
       h('li', {}, h('b', {}, '설정·네거티브 '), '— CFG, Rescale, 샘플러, 스텝(모델 범위 안), 네거티브 묶음을 조정해요.'),
       h('li', {}, h('b', {}, '검증 '), '— 상위 후보를 새 시드로 다시 그려서 최종 결과를 정해요.')),
-    h('p', { class: 'note' }, '점수 = CLIP 그림체 유사도 + 색감·명암·선 통계. 숫자만으로는 눈매나 분위기를 놓치니까 ', h('b', {}, '👍 고르기'), '를 켜두는 걸 추천해요.'),
+    h('p', { class: 'note' }, '점수 = 애니 태거로 본 그림 유사도 + 화풍 태그가 예시와 얼마나 같은지 + 색감·명암·선 통계 (+ CLIP 조금). 숫자만으로는 눈매나 분위기를 놓치니까 ', h('b', {}, '👍 고르기'), '를 켜두는 걸 추천해요.'),
     h('p', { class: 'note' }, '튜너가 만든 이미지는 히스토리에 🎛 표시로 남아요.'));
 }
 
