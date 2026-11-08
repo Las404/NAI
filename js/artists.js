@@ -42,7 +42,7 @@ let cache = null;
 
 export async function loadArtists() {
   if (cache) return cache;
-  const res = await fetch('assets/artists.json');
+  const res = await fetch(new URL('../assets/artists.json', import.meta.url));
   const json = await res.json();
   cache = json.rows.map(([tag, lu, ld, cu, cd, mu, md]) => {
     const g = {};
@@ -54,9 +54,13 @@ export async function loadArtists() {
   return cache;
 }
 
-export function queryArtists(list, { q = '', gallery = 'loose', sort = 'score', minVotes = 0 }) {
+// mark: 'all' | 'fav' | 'hidden' / favorites, hidden: Set<tag>  ('all'이면 숨긴 작가는 빠짐)
+export function queryArtists(list, { q = '', gallery = 'loose', sort = 'score', minVotes = 0, mark = 'all', favorites, hidden }) {
   const needle = q.trim().toLowerCase().replace(/^artist:\s*/, '').replace(/_/g, ' ');
   let out = list.filter((a) => a.g[gallery]);
+  if (mark === 'fav' && favorites) out = out.filter((a) => favorites.has(a.tag));
+  else if (mark === 'hidden' && hidden) out = out.filter((a) => hidden.has(a.tag));
+  else if (hidden) out = out.filter((a) => !hidden.has(a.tag));
   if (needle) out = out.filter((a) => a.lower.includes(needle));
   if (minVotes > 0) out = out.filter((a) => a.g[gallery].up + a.g[gallery].down >= minVotes);
   const key = {

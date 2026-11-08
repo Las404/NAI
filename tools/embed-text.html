@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>화풍 태그 CLIP 텍스트 임베딩 (로컬 전용)</title>
+<style>body { font: 14px system-ui, sans-serif; background: #121317; color: #e7e8ec; padding: 24px; } pre { background: #1b1d23; padding: 12px; }</style>
+</head>
+<body>
+<h2>화풍 태그 텍스트 임베딩</h2>
+<p><code>assets/style-tags.json</code>의 태그를 CLIP 텍스트 인코더로 변환해 <code>assets/clip/style-text.json</code>에 저장해요. serve.ps1에서만 동작해요.</p>
+<button id="go">시작</button>
+<pre id="log"></pre>
+<script type="module">
+import { AutoTokenizer, CLIPTextModelWithProjection } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3';
+const MODEL = 'Xenova/clip-vit-base-patch32';
+const TEMPLATE = 'an anime illustration, {}';
+const log = (m) => (document.getElementById('log').textContent += m + '\n');
+window.__textState = 'idle';
+
+async function run() {
+  window.__textState = 'running';
+  const groups = (await (await fetch('../assets/style-tags.json')).json()).groups;
+  const tokenizer = await AutoTokenizer.from_pretrained(MODEL);
+  const model = await CLIPTextModelWithProjection.from_pretrained(MODEL, { dtype: 'q8', device: 'wasm' });
+  const embed = async (text) => {
+    const inputs = tokenizer([text], { padding: true, truncation: true });
+    const { text_embeds } = await model(inputs);
+    const v = Array.from(text_embeds.data);
+    const n = Math.hypot(...v) || 1;
+    return v.map((x) => Math.round((x / n) * 127));
+  };
+  const out = { model: MODEL, template: TEMPLATE, scale: 127, baseline: await embed('an anime illustration'), tags: {} };
+  for (const g of groups) {
+    for (const [tag] of g.tags) {
+      out.tags[tag] = await embed(TEMPLATE.replace('{}', tag));
+    }
+    log(`${g.label}: ${g.tags.length}개`);
+  }
+  const res = await fetch('/__save/assets/clip/style-text.json', { method: 'PUT', body: JSON.stringify(out) });
+  log(res.status === 204 ? '저장 완료' : '저장 실패 ' + res.status);
+  window.__textState = res.status === 204 ? 'finished' : 'error';
+}
+document.getElementById('go').addEventListener('click', () => run().catch((e) => { log('오류 ' + e.message); window.__textState = 'error: ' + e.message; }));
+if (location.hash === '#auto') document.getElementById('go').click();
+</script>
+</body>
+</html>

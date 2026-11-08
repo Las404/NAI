@@ -35,10 +35,13 @@ export function buildBody(s) {
   const sampler = medium ? 'k_euler_ancestral' : s.sampler;
   const negative = medium ? '' : s.negative;
 
-  const charCaptions = s.character
-    ? [{ char_caption: s.character, centers: [{ x: 0.5, y: 0.5 }] }]
-    : [];
-  const charNeg = s.character ? [{ char_caption: '', centers: [{ x: 0.5, y: 0.5 }] }] : [];
+  // 캐릭터: [{ prompt, uc, x, y }]  x/y가 null이면 자동 배치
+  const maxChars = v5 ? 22 : 6;
+  const chars = (s.characters || []).filter((c) => c.prompt && c.prompt.trim()).slice(0, maxChars);
+  const useCoords = chars.some((c) => c.x != null && c.y != null);
+  const center = (c) => ({ x: c.x ?? 0.5, y: c.y ?? 0.5 });
+  const charCaptions = chars.map((c) => ({ char_caption: c.prompt.trim(), centers: [center(c)] }));
+  const charNeg = chars.map((c) => ({ char_caption: medium ? '' : (c.uc || '').trim(), centers: [center(c)] }));
 
   return {
     input: s.prompt,
@@ -67,20 +70,18 @@ export function buildBody(s) {
       legacy_v3_extend: false,
       uncond_scale: 1,
       prefer_brownian: true,
-      use_coords: false,
+      use_coords: useCoords,
       legacy_uc: false,
       normalize_reference_strength_multiple: true,
       deliberate_euler_ancestral_bug: false,
-      characterPrompts: s.character
-        ? [{ prompt: s.character, uc: '', center: { x: 0.5, y: 0.5 }, enabled: true }]
-        : [],
+      characterPrompts: chars.map((c) => ({ prompt: c.prompt.trim(), uc: medium ? '' : (c.uc || '').trim(), center: center(c), enabled: true })),
       negative_prompt: negative,
       reference_image_multiple: [],
       reference_information_extracted_multiple: [],
       reference_strength_multiple: [],
       v4_prompt: {
         caption: { base_caption: s.prompt, char_captions: charCaptions },
-        use_coords: false,
+        use_coords: useCoords,
         use_order: true,
       },
       v4_negative_prompt: {

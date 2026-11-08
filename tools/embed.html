@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>CLIP 임베딩 사전 계산 (로컬 전용)</title>
+<style>
+  body { font: 14px system-ui, sans-serif; background: #121317; color: #e7e8ec; padding: 24px; max-width: 760px; margin: auto; }
+  button, input, select { font: inherit; padding: 4px 10px; }
+  pre { background: #1b1d23; padding: 12px; border-radius: 8px; white-space: pre-wrap; max-height: 50vh; overflow: auto; }
+  progress { width: 100%; height: 18px; }
+</style>
+</head>
+<body>
+<h2>CLIP 임베딩 사전 계산</h2>
+<p>nax.moe "자유 프롬프트(여)" 샘플 중 투표가 많은 작가 N명의 이미지를 그림체 특징 벡터(전체 + 2×2 조각)로 바꿔
+<code>assets/clip/</code>에 저장해요. <b>serve.ps1 로컬 서버에서만</b> 동작해요 (저장에 PUT /__save 사용).
+중간에 멈춰도 다시 열면 이어서 계산해요.</p>
+<label>작가 수 <input id="n" type="number" value="5000" style="width:6em"></label>
+<label>동시 다운로드 <input id="conc" type="number" value="6" style="width:4em"></label>
+<label>장치 <select id="device"><option value="webgpu">WebGPU (fp32)</option><option value="wasm">WASM (q8)</option></select></label>
+<button id="go">시작</button>
+<p><progress id="bar" value="0" max="1"></progress></p>
+<pre id="log"></pre>
+<script type="module">
+import { AutoProcessor, CLIPVisionModelWithProjection, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3';
+import { imageUrl } from '../js/artists.js';
+import { styleVector, METHOD } from '../js/clipfeat.js';
+
+const MODEL = 'Xenova/clip-vit-base-patch32';
+const DIM = 512;
+const SAVE_EVERY = 250;
+const log = (m) => { const el = document.getElementById('log'); el.textContent = `[${new Date().toLocaleTimeString()}] ${m}\n` + el.textContent; };
+window.__embedState = { phase: 'idle', done: 0, total: 0, failed: 0 };
+
+async function save(path, data) {
+  const res = await fetch('/__save/' + path, { method: 'PUT', body: data });
+  if (res.status !== 204) throw new Error('save failed ' + res.status);
+}
+
+async function run() {
+  const N = Number(document.getElementById('n').value);
+  const conc = Number(document.getElementById('conc').value);
+  const device = document.getElementById('device').value;
+  const json = await (await fetch('../assets/artists.json')).json();
+  // 투표 수(up+down) 많은 순 → 동률이면 좋아요 많은 순
+  const tags = json.rows
+    .filter((r) => r[1] !== null)
+    .map((r) => ({ tag: r[0], up: r[1], down: r[2] }))
+    .sort((a, b) => (b.up + b.down) - (a.up + a.down) || b.up - a.up || a.tag.localeCompare(b.tag))
+    .slice(0, N)
+    .map((r) => r.tag);
+
+  // 이어하기 (같은 모델·방식·작가 목록일 때만)
+  const vecs = new Float32Array(tags.length * DIM);
+  let done = 0;
+  let failed = [];
+  try {
+    const meta = await (await fetch('../assets/clip/progress.json', { cache: 'no-store' })).json();
+    if (meta.model === MODEL && meta.method === METHOD && JSON.stringify(meta.tags) === JSON.stringify(tags)) {
+      const buf = await (await fetch('../assets/clip/progress.f32', { cache: 'no-store' })).arrayBuffer();
+      vecs.set(new Float32Array(buf).subarray(0, meta.done * DIM));
+      done = meta.done; failed = meta.failed || [];
+      log(`이어하기: ${done}/${tags.length}`);
+    }
+  } catch {}
+
+  log(`CLIP 모델 불러오는 중… (${device})`);
+  window.__embedState.phase = 'loading-model';
+  const processor = await AutoProcessor.from_pretrained(MODEL);
+  const model = await CLIPVisionModelWithProjection.from_pretrained(MODEL, device === 'webgpu' ? { dtype: 'fp32', device: 'webgpu' } : { dtype: 'q8', device: 'wasm' });
+  const eng = { RawImage, processor, model };
+  log('모델 준비 완료');
+
+  const bar = document.getElementById('bar');
+  bar.max = tags.length;
+  window.__embedState = { phase: 'running', done, total: tags.length, failed: failed.length };
+  const t0 = performance.now();
+  const startDone = done;
+
+  const fetchBlob = async (tag) => {
+    for (let i = 0; i < 3; i++) {
+      try {
+        const r = await fetch(imageUrl(tag, 'loose'));
+        if (r.ok) return await r.blob();
+      } catch {}
+      await new Promise((ok) => setTimeout(ok, 1500 * (i + 1)));
+    }
+    return null;
+  };
+  const queue = new Map();
+  const prefetch = (i) => { if (i < tags.length && !queue.has(i)) queue.set(i, fetchBlob(tags[i])); };
+
+  for (let i = done; i < tags.length; i++) {
+    for (let k = 0; k < conc; k++) prefetch(i + k);
+    const blob = await queue.get(i);
+    queue.delete(i);
+    if (blob) {
+      try {
+        vecs.set(await styleVector(eng, blob), i * DIM);
+      } catch (e) { failed.push(tags[i]); log(`실패(분석): ${tags[i]} ${e.message}`); }
+    } else { failed.push(tags[i]); log(`실패(다운로드): ${tags[i]}`); }
+    done = i + 1;
+    bar.value = done;
+    window.__embedState = { phase: 'running', done, total: tags.length, failed: failed.length };
+    if (done % SAVE_EVERY === 0 || done === tags.length) {
+      await save('assets/clip/progress.f32', vecs.slice(0, done * DIM).buffer);
+      await save('assets/clip/progress.json', JSON.stringify({ model: MODEL, method: METHOD, tags, done, failed }));
+      const rate = (done - startDone) / ((performance.now() - t0) / 1000);
+      log(`${done}/${tags.length} 저장 · ${rate.toFixed(2)}장/초 · 남은 시간 약 ${Math.round((tags.length - done) / rate / 60)}분`);
+    }
+  }
+
+  // 최종: 실패 항목 제외 → int8 양자화
+  const keep = tags.map((t, i) => i).filter((i) => !failed.includes(tags[i]));
+  const q = new Int8Array(keep.length * DIM);
+  keep.forEach((i, row) => {
+    for (let d = 0; d < DIM; d++) q[row * DIM + d] = Math.max(-127, Math.min(127, Math.round(vecs[i * DIM + d] * 127)));
+  });
+  await save('assets/clip/embeds.i8', q.buffer);
+  await save('assets/clip/index.json', JSON.stringify({
+    model: MODEL, method: METHOD, dtype: 'q8', dim: DIM, scale: 127, gallery: 'loose',
+    created: new Date().toISOString().slice(0, 10),
+    note: 'nax.moe danbooru-artist-tags-2-v5 샘플의 그림체 특징 벡터 (CLIP 전체+2x2 조각, L2 정규화, int8)',
+    tags: keep.map((i) => tags[i]),
+  }));
+  window.__embedState = { phase: 'finished', done, total: tags.length, failed: failed.length };
+  log(`완료! ${keep.length}명 저장 (실패 ${failed.length})`);
+}
+
+document.getElementById('go').addEventListener('click', () => {
+  document.getElementById('go').disabled = true;
+  run().catch((e) => { log('오류: ' + e.message); window.__embedState.phase = 'error: ' + e.message; });
+});
+if (location.hash === '#auto') document.getElementById('go').click();
+</script>
+</body>
+</html>

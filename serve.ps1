@@ -19,6 +19,18 @@ try {
     $file = [IO.Path]::GetFullPath((Join-Path $root $path))
     $res = $ctx.Response
     try {
+      # 로컬 개발 전용: tools/ 페이지가 계산한 결과를 assets/ 아래에 저장 (PUT /__save/assets/...)
+      if ($ctx.Request.HttpMethod -eq 'PUT' -and $path.StartsWith('__save/assets/')) {
+        $target = [IO.Path]::GetFullPath((Join-Path $root $path.Substring(7)))
+        if ($target.StartsWith((Join-Path $root 'assets'))) {
+          New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+          $ms = New-Object IO.MemoryStream
+          $ctx.Request.InputStream.CopyTo($ms)
+          [IO.File]::WriteAllBytes($target, $ms.ToArray())
+          $res.StatusCode = 204
+        } else { $res.StatusCode = 403 }
+        continue
+      }
       if ($file.StartsWith($root) -and (Test-Path $file -PathType Leaf)) {
         $bytes = [IO.File]::ReadAllBytes($file)
         $ext = [IO.Path]::GetExtension($file).ToLower()
