@@ -21,6 +21,7 @@ function det(key, defOpen, summary, ...children) {
 
 let refBlob = null;
 let refInfo = null; // analyzeReference 결과
+let refUrl = '';
 const opt = {
   brain: local.get('tunerBrain', 'clip'),
   humanPick: local.get('tunerHumanPick', true),
@@ -97,7 +98,7 @@ export function show() { status(); estimate(); render(); }
 async function setRef(file) {
   refBlob = file;
   refInfo = null;
-  const url = URL.createObjectURL(file);
+  const url = refUrl = URL.createObjectURL(file);
   $('tuRef').replaceChildren(h('img', { src: url, class: 'tu-ref', onclick: () => openLightbox(url, '예시 이미지') }), h('div', { class: 'note' }, '다른 그림으로 바꾸려면 빈 곳을 누르거나 끌어다 놓기'));
   const info = $('tuRefInfo');
   info.replaceChildren(h('div', { class: 'note' }, h('span', { class: 'spinner tiny-spin' }), ' 예시 분석 중… (처음엔 CLIP 모델을 받느라 조금 걸려요)'));
@@ -169,7 +170,7 @@ async function start() {
   const s = state.settings;
   const model = runModel();
   const [lo, hi] = stepRange(model);
-  const msg = `${opt.budget}장까지 ${queue.delay}초 간격으로 자동 생성하며 비교해요${opt.humanPick ? ' (라운드마다 멈추고 👍 고르기)' : ''}.\n모델 ${MODELS[model]?.label} · 스텝 ${lo}~${hi} · 크기는 예시 비율에 맞춰 무료 조건 안에서 골라요.\n언제든 ■ 정지할 수 있어요. 시작할까요?`;
+  const msg = `${opt.mode === 'current' ? '지금 작가 조합에서 출발해 ' : '분석한 작가 상위 5명 조합에서 출발해 '}${opt.budget}장까지 ${queue.delay}초 간격으로 자동 생성하며 비교해요${opt.humanPick ? ' (라운드마다 멈추고 👍 고르기)' : ''}.\n모델 ${MODELS[model]?.label} · 스텝 ${lo}~${hi} · 크기는 예시 비율에 맞춰 무료 조건 안에서 골라요.\n언제든 ■ 정지할 수 있어요. 시작할까요?`;
   if (!confirm(msg)) return;
   const run = createRun({
     refBlob, mode: opt.mode,
@@ -291,8 +292,9 @@ function intro() {
   return h('div', { class: 'panel tu-intro' },
     h('h3', {}, '이렇게 깎아요'),
     h('ol', { class: 'tu-steps' },
-      h('li', {}, h('b', {}, '예시 분석 '), '— 비슷한 작가 48명, 화풍 태그, 채도·대비·선 굵기를 재요.'),
-      h('li', {}, h('b', {}, '작가 고르기 '), '— 후보 작가를 한 명씩 같은 시드로 그려보고, 잘 맞는 작가끼리 가중치를 섞어요.'),
+      h('li', {}, h('b', {}, '예시 분석 '), '— 비슷한 작가 후보, 화풍 태그, 채도·대비·선 굵기를 재요.'),
+      h('li', {}, h('b', {}, '조합 · 빼보기 '), '— 분석 상위 작가 5명을 유사도 비례 가중치로 섞어 그리고, 한 명씩 빼보고, 가중치를 바꾸고, 다른 분석 작가로 바꿔봐요. (지금 프롬프트 다듬기는 쓰시던 작가 조합에서 출발)'),
+      h('li', {}, h('b', {}, '조합 다듬기 '), '— 제일 닮은 조합에서 가중치 조정·빼기·더하기·바꾸기, 1·2위 섞기를 반복해요.'),
       h('li', {}, h('b', {}, '화풍 태그 '), '— 색감·대비·선·연도·복잡도 태그를 넣고 빼고 세기를 바꿔봐요.'),
       h('li', {}, h('b', {}, '설정·네거티브 '), '— CFG, Rescale, 샘플러, 스텝(모델 범위 안), 네거티브 묶음을 조정해요.'),
       h('li', {}, h('b', {}, '검증 '), '— 상위 후보를 새 시드로 다시 그려서 최종 결과를 정해요.')),

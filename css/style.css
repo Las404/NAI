@@ -407,6 +407,15 @@ dialog.lightbox .close { position: absolute; right: 12px; top: 12px; }
 .tu-settings > div { background: var(--bg); border-radius: 8px; padding: 6px 12px; display: flex; flex-direction: column; min-width: 80px; }
 .tu-settings .note { margin: 0; font-size: 11px; }
 .tu-intro .tu-steps li { margin-bottom: 4px; }
+.tu-artpick { border-color: var(--accent); }
+.tu-artgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.tu-artgrid figure { position: relative; margin: 0; border: 3px solid transparent; border-radius: 10px; overflow: hidden; background: var(--panel-2); cursor: pointer; }
+.tu-artgrid figure.on { border-color: var(--good); }
+.tu-artgrid figure.ref { border-color: var(--accent); cursor: zoom-in; }
+.tu-artgrid img { width: 100%; aspect-ratio: 2 / 3; object-fit: cover; object-position: 50% 15%; display: block; }
+.tu-artgrid figcaption { font-size: 11px; padding: 3px 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tu-zoom { position: absolute; left: 5px; top: 5px; padding: 1px 5px; font-size: 12px; background: rgba(0,0,0,.6) !important; border: none !important; opacity: 0; transition: opacity .15s; }
+.tu-artgrid figure:hover .tu-zoom { opacity: 1; }
 details.panel > summary { cursor: pointer; }
 details.panel[open] > summary { margin-bottom: 10px; }
 .tu-left { position: sticky; top: calc(var(--header) + 16px); max-height: calc(100vh - var(--header) - 32px); overflow-y: auto; scrollbar-width: thin; }

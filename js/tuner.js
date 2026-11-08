@@ -186,7 +186,8 @@ export function createRun(opts) {
     used: 0, round: 0, cost: 0,
     cands: [], pending: [], rounds: [], analysis: '', clipHints: '', final: null, log: [],
     brain: opts.brain || 'clip', humanPick: !!opts.humanPick, waitingPick: false,
-    startSettings: opts.startSettings || null, // CLIP 두뇌 + 현재 프롬프트 출발일 때 설정
+    startSettings: opts.startSettings || null,
+    pickedArtists: opts.pickedArtists || [], // 샘플 보고 내가 고른 작가 // CLIP 두뇌 + 현재 프롬프트 출발일 때 설정
   };
 }
 
@@ -240,6 +241,8 @@ async function analyze(run) {
     + '\n\nCLIP style-tag hints (z-score within group, higher = more prominent):\n'
     + Object.entries(res.styles).map(([g, list]) => `${g}: ` + list.slice(0, 5).map((s) => `${s.tag} (${s.score.toFixed(1)})`).join(', ')).join('\n')
     + `\n\nMeasured color/line stats of the reference: ${describeStats(run.refStats).join(', ') || 'average'} (mean saturation ${run.refStats.meanS.toFixed(2)}, value contrast ${run.refStats.stdV.toFixed(2)}, edge density ${run.refStats.edgeD.toFixed(2)})`
+    + (run.pickedArtists.length ? `\n\nThe USER looked at sample renders and picked these artists as closest to the reference — build combinations mainly from them: ${run.pickedArtists.map((t) => 'artist:' + t).join(', ')}` : '')
+    + `\nAlways combine 2-4 artists (more artists tends to look worse), weights 0.3-1.0; never test a single artist alone. On V5 models never use any weight above 1.0 (it becomes too strong); on V4.5 keep weights within 1.3.`
     + `\nA thorough negative prompt to start from (adapt it):\n${Object.values(NEG_BLOCKS).join(', ')}`;
   run.refImg = await blobToClaudeImage(run.refBlob, 1024);
   run.refImg.cache_control = { type: 'ephemeral' }; // 매 라운드 같은 앞부분 → 캐시
@@ -574,7 +577,11 @@ async function clipAnalyze(run) {
   const ref = await analyzeReference(run.refBlob);
   run.refStats = ref.stats;
   if (!run.content) run.content = ref.content;
-  run.artistPool = ref.artists.slice(0, 48).map((a) => a.tag);
+  // 분석한 작가 상위 10명이 후보. 첫 조합 = 상위 5명, 가중치는 유사도에 비례 (0.4~1.0)
+  const topA = ref.artists.slice(0, 10);
+  run.artistPool = topA.map((a) => a.tag);
+  const hiS = topA[0]?.sim || 1, loS = topA[2]?.sim ?? hiS;
+  run.startCombo = topA.slice(0, 3).map((a) => ({ tag: a.tag, w: round2(hiS > loS ? 0.5 + (0.5 * (a.sim - loS)) / (hiS - loS) : 0.7) }));
   run.styleHints = ref.styleHints;
   run.hintDetail = ref.hintDetail;
   run.analysis = `비슷한 작가 (CLIP): ${run.artistPool.slice(0, 8).join(', ')} …\n두드러진 화풍 (CLIP): ${ref.styleHints.join(', ') || '없음'}\n색감·선: ${ref.statWords.join(', ') || '보통'} (채도 ${ref.stats.meanS.toFixed(2)} · 대비 ${ref.stats.stdV.toFixed(2)} · 윤곽 ${ref.stats.edgeD.toFixed(2)})`;
@@ -592,15 +599,17 @@ async function clipAnalyze(run) {
     run.base = { artists: [], tags: startStyleTags(run), extra: '', quality: QUALITY_DEFAULT, negative: buildNegative(run.refStats, run.styleHints), ...settings };
   }
   run.seen = new Set();
-  run.screened = []; // 작가 단독 점수 [{ tag, score }]
   const reserve = run.budget >= 30 ? Math.min(6, Math.floor(run.budget * 0.1)) : 0;
   const avail = run.budget - reserve;
   // 단계별 몫을 라운드(후보 수) 단위로 맞춤 → 작은 예산에서도 ①~④가 다 돌아감
   const rounds = (share) => Math.max(1, Math.round((avail * share) / run.batch)) * run.batch;
-  run.plan = { reserve, screen: rounds(0.3), mix: rounds(0.3), tags: rounds(0.2) };
+  run.plan = { reserve, screen: rounds(0.35), mix: rounds(0.3), tags: rounds(0.15) };
   run.round = 0;
   log(`분석 완료 · 내용 프롬프트: ${run.content || '(없음)'}`, 'good');
 }
+
+// 튜너가 쓰는 가중치 상한: V5는 1.0 넘으면 너무 세져서 1.0, V4.5는 1.3
+const maxWeight = (run) => (MODELS[run.model]?.v5 ? 1 : 1.3);
 
 function bestSpec(run) {
   const top = leaderboard(run, 1)[0];
@@ -622,52 +631,94 @@ function nextBatch(run, k) {
   };
   const base = run.base;
 
+  const pool = run.artistPool;
+  const maxW = maxWeight(run);
+  const MAX_ART = 4; // 작가가 많으면 안 예뻐질 가능성이 커서 4명까지
+  const W = [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1].filter((w) => w <= maxW);
+  // 작가 2~3명 조합 (앞쪽 = 더 비슷한 작가가 잘 뽑힘). 대표 작가 한 명은 0.7 이상
+  const randomCombo = () => {
+    const n = Math.min(pool.length, 2 + Math.floor(Math.random() * 2));
+    const avail = pool.slice();
+    const arts = [];
+    while (arts.length < n && avail.length) {
+      const t = avail.splice(Math.floor(Math.pow(Math.random(), 1.7) * avail.length), 1)[0];
+      arts.push({ tag: t, w: pickRand(W) });
+    }
+    if (arts.length) arts[0].w = Math.max(arts[0].w, 0.7);
+    return arts;
+  };
+  // 조합 하나를 조금만 바꾸기 (가중치 / 한 명 바꾸기 / 한 명 더하기 / 한 명 빼기). 4명 넘으면 빼기 우선, 2명 아래로는 안 뺌
+  const mutate = (arts) => {
+    const s = clone(arts).map((a) => ({ ...a, w: Math.min(a.w, maxW) }));
+    const m = s.length > MAX_ART ? 0.95 : Math.random();
+    const others = pool.filter((t) => !s.some((a) => nrm(a.tag) === nrm(t)));
+    if (m < 0.45 || !others.length) {
+      const a = pickRand(s);
+      a.w = round2(clamp(a.w + pickRand([-0.2, -0.1, 0.1, 0.2]), 0.2, maxW, 0.6));
+      return [s, `가중치 ${a.tag} → ${a.w}`];
+    }
+    if (m < 0.7) {
+      const i = Math.floor(Math.random() * s.length);
+      const t = pickRand(others);
+      const gone = s[i].tag;
+      s[i] = { tag: t, w: s[i].w };
+      return [s, `바꾸기 ${gone} → ${t}`];
+    }
+    if (m < 0.85 && s.length < MAX_ART) {
+      const t = pickRand(others);
+      s.push({ tag: t, w: pickRand([0.3, 0.4, 0.5]) });
+      return [s, `더하기 ${t}`];
+    }
+    if (s.length > 2) {
+      const [gone] = s.splice(Math.floor(Math.random() * s.length), 1);
+      return [s, `빼기 ${gone.tag}`];
+    }
+    const a = pickRand(s);
+    a.w = round2(clamp(a.w + pickRand([-0.2, 0.2]), 0.2, maxW, 0.6));
+    return [s, `가중치 ${a.tag} → ${a.w}`];
+  };
+  const comboName = (arts) => arts.map((a) => `${a.tag}${a.w !== 1 ? ' ' + a.w : ''}`).join(' + ');
+
   if (used < screen) {
-    run.phase = '① 작가 단독 시험';
-    if (!run.cands.length && base.artists.length) push(clone(base), '출발점 (지금 프롬프트)');
-    const tried = new Set(run.screened.map((s) => s.tag));
-    for (const tag of run.artistPool) {
-      if (out.length >= k) break;
-      if (tried.has(tag)) continue;
-      push({ ...clone(base), artists: [{ tag, w: 1 }] }, `작가 단독: ${tag}`);
+    // 출발 조합(지금 프롬프트 작가 or 분석 상위 5명)을 그리고, 한 명씩 빼보고, 가중치 바꿔보고, 분석 작가로 바꿔보기
+    run.phase = '① 조합 · 빼보기';
+    const start = base.artists.length ? base.artists : run.startCombo || [];
+    if (start.length) {
+      push({ ...clone(base), artists: clone(start) }, base.artists.length ? '출발점 (지금 프롬프트 작가)' : `분석 상위 조합 ${comboName(start)}`);
+      if (start.some((a) => a.w > maxW)) push({ ...clone(base), artists: start.map((a) => ({ ...a, w: Math.min(a.w, maxW) })) }, `작가 가중치 ${maxW} 넘는 것 낮추기`);
+      if (start.length > 2) {
+        for (const a of start) push({ ...clone(base), artists: clone(start.filter((x) => x !== a)) }, `빼보기 ${a.tag}`);
+      }
+    }
+    let guard = 0;
+    while (out.length < k && guard++ < 300) {
+      if (start.length && Math.random() < 0.7) {
+        const [arts, why] = mutate(start);
+        push({ ...clone(base), artists: arts }, why);
+      } else if (pool.length) {
+        const arts = randomCombo();
+        push({ ...clone(base), artists: arts }, `다른 조합 ${comboName(arts)}`);
+      }
     }
     if (out.length) return out;
   }
-  const topArtists = run.screened.map((s) => ({ tag: s.tag, score: scoreOf(run, s.cand).total })).sort((a, b) => b.score - a.score).slice(0, 6).map((s) => s.tag);
-  if (used < screen + mix && topArtists.length) {
-    run.phase = '② 작가 조합·가중치';
+  if (used < screen + mix && pool.length) {
+    run.phase = '② 조합 다듬기';
+    const top = leaderboard(run, 2).map(({ c }) => c.spec).filter(Boolean);
     const best = bestSpec(run);
     let guard = 0;
     while (out.length < k && guard++ < 300) {
       const r = Math.random();
-      if (r < 0.4 || best.artists.length < 2) {
-        // 새 조합: 상위 작가 2~4명, 가중치 0.4~1.2 (1위에 가까울수록 무겁게)
-        const n = 2 + Math.floor(Math.random() * 3);
-        const pool = topArtists.slice();
-        const artists = [];
-        while (artists.length < n && pool.length) {
-          const t = pool.splice(Math.floor(Math.random() * Math.min(pool.length, 4)), 1)[0];
-          artists.push({ tag: t, w: round2(0.4 + Math.random() * 0.8) });
-        }
-        push({ ...best, artists }, `새 조합 ${artists.map((a) => a.tag).join(' + ')}`);
+      if (r < 0.2 && top.length === 2) {
+        // 상위 두 조합 섞기
+        const merged = [...top[0].artists];
+        for (const a of top[1].artists) if (!merged.some((x) => nrm(x.tag) === nrm(a.tag))) merged.push(a);
+        const arts = clone(shuffle(merged.slice(1)).slice(0, 1 + Math.floor(Math.random() * 2)));
+        arts.unshift(clone(merged[0]));
+        push({ ...best, artists: arts }, `1·2위 섞기 ${comboName(arts)}`);
       } else {
-        const s = clone(best);
-        const m = Math.random();
-        if (m < 0.55) {
-          const a = pickRand(s.artists);
-          a.w = round2(clamp(a.w + pickRand([-0.3, -0.2, -0.1, 0.1, 0.2, 0.3]), 0.2, 1.5, 1));
-          push(s, `가중치 조정 ${a.tag} → ${a.w}`);
-        } else if (m < 0.75 && s.artists.length > 1) {
-          const [gone] = s.artists.splice(Math.floor(Math.random() * s.artists.length), 1);
-          push(s, `빼보기 ${gone.tag}`);
-        } else {
-          const cand = topArtists.filter((t) => !s.artists.some((a) => a.tag === t));
-          if (cand.length && s.artists.length < 5) {
-            const t = pickRand(cand);
-            s.artists.push({ tag: t, w: round2(0.3 + Math.random() * 0.5) });
-            push(s, `더해보기 ${t}`);
-          }
-        }
+        const [arts, why] = mutate(best.artists.length ? best.artists : randomCombo());
+        push({ ...best, artists: arts }, why);
       }
     }
     return out;
@@ -682,14 +733,18 @@ function nextBatch(run, k) {
     for (const tag of run.styleHints || []) add(tag, 1, `태그 더하기: ${tag}`);
     const extraIdeas = ['anime coloring', 'soft line', 'ligne claire', 'detailed hair', 'shiny skin', 'rim light', 'depthness', 'year 2025', 'year 2022'];
     if (MODELS[run.model]?.v5) extraIdeas.push('ultra complexity', 'meta:golden era');
-    if (st.meanS > 0.35) { add('vibrant colors', 1.2, '선명한 색 강조'); ideas.push([{ ...best, tags: [...best.tags, { tag: 'flat color', w: -1.5 }] }, '단색 채색 밀어내기 (-1.5)']); }
+    if (st.meanS > 0.35) { add('vibrant colors', Math.min(1.2, maxW), '선명한 색'); if (!inBest('flat color')) ideas.push([{ ...best, tags: [...best.tags, { tag: 'flat color', w: -1 }] }, '단색 채색 밀어내기 (-1)']); }
     if (st.meanS < 0.22) add('pastel colors', 1, '파스텔 색');
-    if (st.stdV > 0.27) add('high contrast', 1.2, '대비 강조');
+    if (st.stdV > 0.27) add('high contrast', Math.min(1.2, maxW), '대비');
     for (const tag of extraIdeas) add(tag, 1, `태그 더하기: ${tag}`);
     for (const t of best.tags) {
       ideas.push([{ ...best, tags: best.tags.filter((x) => x !== t) }, `태그 빼기: ${t.tag}`]);
-      if (t.w > 0) ideas.push([{ ...best, tags: best.tags.map((x) => (x === t ? { ...x, w: round2(Math.min(2, x.w * 1.3)) } : x)) }, `태그 강하게: ${t.tag}`]);
+      // 튜너가 올리는 강조는 1.3까지만 (원래 더 센 건 그대로 두고 약하게만 시험)
+      if (t.w > 0 && t.w + 0.2 <= maxW + 1e-6) ideas.push([{ ...best, tags: best.tags.map((x) => (x === t ? { ...x, w: round2(x.w + 0.2) } : x)) }, `태그 조금 강하게: ${t.tag}`]);
+      if (t.w > maxW) ideas.push([{ ...best, tags: best.tags.map((x) => (x === t ? { ...x, w: maxW } : x)) }, `강조 줄이기: ${t.tag} ${t.w} → ${maxW}`]);
     }
+    // 상한 넘는 강조가 있으면 전부 낮춘 버전을 먼저 시험
+    if (best.tags.some((t) => t.w > maxW)) push({ ...best, tags: best.tags.map((t) => ({ ...t, w: Math.min(t.w, maxW) })) }, `화풍 강조 전부 ${maxW}로 낮추기`);
     for (const [s, why] of shuffle(ideas)) push(s, why);
     if (out.length) return out.slice(0, k);
   }
@@ -751,8 +806,6 @@ async function clipLoop(run) {
       run.pickResolve = null;
       run.waitingPick = false;
     }
-    // 작가 단독 결과 기록 (점수는 쓸 때마다 다시 계산: 👍·정규화 반영)
-    for (const c of cands) if (c.images.length && c.rationale.includes('작가 단독')) run.screened.push({ tag: c.spec.artists[0].tag, cand: c });
     const top = leaderboard(run, 1)[0];
     const bestNow = Math.max(...cands.filter((c) => c.images.length).map((c) => scoreOf(run, c).match));
     run.rounds.push({ round: run.round, critique: `${run.phase} — 이번 라운드 최고 닮음 ${Math.round(bestNow * 100)}` });
