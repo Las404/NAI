@@ -59,6 +59,12 @@ export function loadEngine(onProgress = () => {}) {
   return enginePromise;
 }
 
+// 그림체 특징 벡터 하나만 (자동 튜너 점수용)
+export async function embedStyle(blob) {
+  return styleVector(await loadEngine(), blob);
+}
+export const cosine = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+
 async function embedWhole(eng, blob) {
   const image = await eng.RawImage.fromBlob(blob);
   const { image_embeds } = await eng.model(await eng.processor(image));

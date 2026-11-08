@@ -170,7 +170,7 @@ function updateCard(id) {
 }
 
 async function once(s) {
-  if (state.busy || queue.running) return toast('생성 중이에요');
+  if (state.busy || queue.running || state.lock) return toast('생성 중이에요');
   try {
     await runGenerate(state.mix, { forceRandom: true, source: 'scene-once', scene: { ...s } });
   } catch (e) {

@@ -249,6 +249,7 @@ function updateGenButton() {
   b.textContent = queue.running ? `예약 생성 중 ${queue.done}/${queue.jobs.length}` : state.busy ? '생성 중…' : n > 1 ? `${n}장 생성` : '생성';
 }
 function go() {
+  if (state.lock) return toast('자동 튜너가 돌아가는 중이에요');
   if (state.busy || queue.running) return;
   const n = count();
   if (n > 1) startQueue(Array.from({ length: n }, () => ({ mix: state.mix, scene: null })));
@@ -414,7 +415,7 @@ function renderMeta() {
   $('gMeta').replaceChildren(...[
     h('div', {}, `${it.request.width}×${it.request.height}`),
     h('div', { class: 'seed-line', title: '클릭하면 이 시드로 고정', onclick: () => { state.settings.seed = it.request.seed; state.settings.randomSeed = false; save.settings(); toast('시드를 고정했어요'); } }, '🔒 ', it.request.seed),
-    h('div', { class: 'meta-mix', title: it.request.prompt }, (it.sceneName ? `🎬 ${it.sceneName} · ` : '') + mixLabel(it.mix)),
+    h('div', { class: 'meta-mix', title: it.request.prompt }, it.tuner ? `🎛 ${it.label}` : (it.sceneName ? `🎬 ${it.sceneName} · ` : '') + mixLabel(it.mix)),
     costText ? h('div', {}, costText) : null,
     it.savedAs ? h('div', { title: it.savedAs }, '💾 저장됨') : null,
     it.saveError ? h('div', { class: 'bad' }, '💾 저장 실패') : null].filter(Boolean));
@@ -445,7 +446,7 @@ function paintRail() {
   $('gRail').replaceChildren(...rail.slice(0, railLimit).map((it) =>
     h('div', { class: 'rail-item' + (current && current.id === it.id ? ' on' : '') + (it.fav ? ' fav' : ''), 'data-id': it.id },
       h('img', { src: urlOf(it), loading: 'lazy', alt: '', onclick: () => show1(it) }),
-      it.sceneName ? h('span', { class: 'rail-tag' }, '🎬') : null,
+      it.sceneName ? h('span', { class: 'rail-tag' }, '🎬') : it.tuner ? h('span', { class: 'rail-tag' }, '🎛') : null,
       h('button', { class: 'rail-fav', title: '즐겨찾기', onclick: async () => { it.fav = !it.fav; await history.put(it); paintRail(); if (current === it) renderMeta(); } }, it.fav ? '★' : '☆'),
       h('button', { class: 'rail-del', title: '지우기', onclick: () => deleteItems([it]) }, '✕'))));
   if (!rail.length) $('gRail').append(h('div', { class: 'note', style: { padding: '10px' } }, '아직 생성한 이미지가 없어요'));

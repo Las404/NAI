@@ -332,6 +332,31 @@ dialog.lightbox .close { position: absolute; right: 12px; top: 12px; }
 .scene-gallery:empty { display: none; }
 .scene-gallery img { height: 76px; border-radius: 6px; cursor: zoom-in; flex: none; }
 
+/* 자동 튜너 */
+.tu-layout { display: grid; grid-template-columns: 380px minmax(0, 1fr); gap: 16px; align-items: start; }
+.tu-left { position: sticky; top: calc(var(--header) + 16px); max-height: calc(100vh - var(--header) - 32px); overflow-y: auto; scrollbar-width: thin; }
+.tu-ref { max-width: 100%; max-height: 300px; border-radius: 10px; cursor: zoom-in; }
+.good-text { color: var(--good); }
+.pre { white-space: pre-wrap; }
+.tu-steps { padding-left: 18px; line-height: 1.8; }
+.tu-status .meter { margin-top: 8px; }
+.tu-board { display: flex; flex-direction: column; gap: 10px; }
+.tu-cand { display: grid; grid-template-columns: 28px auto minmax(0, 1fr); gap: 10px; background: var(--panel-2); border-radius: 10px; padding: 8px; }
+.tu-rank { width: 26px; height: 26px; border-radius: 50%; background: var(--accent); color: var(--accent-ink); font-weight: 800; display: grid; place-items: center; }
+.tu-imgs { display: flex; gap: 4px; }
+.tu-imgs img { height: 120px; border-radius: 6px; cursor: zoom-in; }
+.tu-imgs.big img { height: 220px; }
+.tu-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.tu-prompt { display: block; font-size: 11px; background: var(--bg); padding: 6px 8px; border-radius: 6px; white-space: pre-wrap; word-break: break-word; }
+.tu-round { border-top: 1px solid var(--line); padding: 8px 0; }
+.tu-thumbs { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: thin; }
+.tu-thumbs figure { margin: 0; flex: none; text-align: center; }
+.tu-thumbs img { height: 110px; border-radius: 6px; cursor: zoom-in; display: block; }
+.tu-thumbs figcaption { font-size: 10px; color: var(--muted); }
+.tu-log { max-height: 260px; overflow-y: auto; }
+.tu-final { border-color: var(--accent); }
+.tu-out { margin-top: 8px; }
+
 /* 지우기·선택 */
 .danger-fill { background: var(--bad) !important; border-color: var(--bad) !important; color: #fff !important; }
 .sel-box { position: absolute; left: 6px; top: 6px; background: rgba(0,0,0,.6) !important; border: none !important; border-radius: 6px; padding: 0 6px; font-size: 16px; opacity: 0; transition: opacity .15s; }
@@ -369,7 +394,8 @@ dialog.lightbox .close { position: absolute; right: 12px; top: 12px; }
   .gen3 { grid-template-columns: 360px minmax(0, 1fr) 150px; }
 }
 @media (max-width: 1100px) {
-  .an-layout { grid-template-columns: 1fr; }
+  .an-layout, .tu-layout { grid-template-columns: 1fr; }
+  .tu-left { position: static; max-height: none; }
   .gen3 { grid-template-columns: 1fr; height: auto; }
   .gen-center { order: -1; height: 62vh; }
   .gen-left { overflow: visible; }

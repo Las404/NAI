@@ -31,6 +31,43 @@ export function requestFrom(mix = state.mix, scene = null) {
 
 export class NeedToken extends Error {}
 
+// 자동 튜너용: 이미 완성된 요청(req)을 그대로 생성해서 히스토리에 저장 (자동저장·배터리 기록 포함)
+// meta: { source, tuner: { runId, round, cand } , label }
+export async function generateRaw(req, meta = {}) {
+  const tk = token.get();
+  if (!tk) throw new NeedToken('API 토큰이 필요해요');
+  if (state.busy) throw new Error('이미 생성 중이에요');
+  state.busy = true;
+  emit('busy', true);
+  const before = snapshot();
+  const t0 = performance.now();
+  try {
+    const { blob } = await generate(tk, req);
+    const item = {
+      time: Date.now(), blob, mix: [], settings: JSON.parse(JSON.stringify(state.settings)),
+      request: req, fav: false, source: meta.source || 'raw', ms: Math.round(performance.now() - t0),
+      tuner: meta.tuner || null, label: meta.label || '',
+    };
+    item.id = await history.add(item);
+    if (meta.autosave) {
+      try { item.savedAs = await saveImage(item); if (item.savedAs) await history.put(item); } catch (e) { item.saveError = e.message; }
+    }
+    state.busy = false;
+    emit('busy', false);
+    emit('generated', item);
+    const usageDone = refreshUsage().then(async () => {
+      const cost = recordGeneration(before, snapshot(), req);
+      if (cost) { item.cost = cost; await history.put(item); emit('cost', item); }
+    });
+    Object.defineProperty(item, 'usageDone', { value: usageDone, enumerable: false });
+    return item;
+  } catch (e) {
+    state.busy = false;
+    emit('busy', false);
+    throw e;
+  }
+}
+
 // opts.fixedSeed: true면 랜덤 시드 설정을 무시하고 현재 시드 사용
 // opts.forceRandom: true면 랜덤 시드 설정과 상관없이 새 시드
 // opts.scene: 씬 모드 씬 객체

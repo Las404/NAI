@@ -77,7 +77,7 @@ function next() {
 }
 
 async function gen(cell) {
-  if (queue.running) return toast('예약 생성 중이에요. 끝나거나 정지한 뒤에 눌러주세요');
+  if (queue.running || state.lock) return toast('예약 생성이나 자동 튜너가 돌아가는 중이에요');
   $('lStatus').textContent = '생성 중…';
   try {
     const item = await runGenerate(cell.mix, { fixedSeed: true, source: 'lab' });

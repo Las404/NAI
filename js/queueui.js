@@ -1,6 +1,6 @@
 // 예약 생성 공용 UI: 시작 확인(약관 안내) + 진행 바
 import { h, toast } from './ui.js';
-import { on } from './state.js';
+import { on, state } from './state.js';
 import { queue, runQueue, stopQueue, preflight, acknowledged, acknowledge, MAX_JOBS, MIN_DELAY } from './queue.js';
 import { prepareAutosave } from './autosave.js';
 
@@ -27,8 +27,14 @@ function ackDialog() {
   });
 }
 
+// 연속 생성 약관 안내를 아직 확인 안 했으면 띄움. 반환: 진행해도 되는지
+export async function ensureAck() {
+  return acknowledged() || ackDialog();
+}
+
 // jobs: [{ mix, scene }]
 export async function startQueue(jobs) {
+  if (state.lock) return toast('자동 튜너가 돌아가는 중이에요');
   if (queue.running) return toast('이미 예약 생성 중이에요');
   if (!jobs.length) return toast('예약된 장이 없어요');
   await prepareAutosave(); // 클릭 직후에 폴더 권한부터 확보 (확인 창을 거치면 권한 요청이 막힐 수 있음)
