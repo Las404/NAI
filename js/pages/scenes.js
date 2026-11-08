@@ -8,6 +8,7 @@ import { attachAutocomplete } from '../autocomplete.js';
 import { mixBar } from '../mixbar.js';
 import { queue } from '../queue.js';
 import { startQueue, queueBar } from '../queueui.js';
+import { deleteItems } from '../remove.js';
 
 const SIZES = [
   ['', '기본 (생성 설정)'], ['832x1216', '832×1216 세로'], ['1216x832', '1216×832 가로'], ['1024x1024', '1024×1024 정사각'],
@@ -44,6 +45,11 @@ export function mount(el) {
     gallery.set(item.sceneId, [item, ...(gallery.get(item.sceneId) || [])]);
     updateCard(item.sceneId);
     updateRun();
+  });
+  on('deleted', async ({ ids }) => {
+    for (const id of ids) { if (urls.has(id)) { URL.revokeObjectURL(urls.get(id)); urls.delete(id); } }
+    for (const [sid, list] of gallery) gallery.set(sid, list.filter((i) => !ids.has(i.id)));
+    for (const s of state.scenes) updateCard(s.id);
   });
   render();
 }
@@ -135,11 +141,23 @@ function card(s, i) {
 
 function fillGallery(el, id) {
   const items = gallery.get(id) || [];
-  el.querySelector('.scount').textContent = items.length ? `생성 ${items.length}장` : '';
-  el.querySelector('.scene-gallery').replaceChildren(...items.slice(0, 14).map((it) => {
+  const s = state.scenes.find((x) => x.id === id);
+  el.querySelector('.scount').replaceChildren(...(items.length ? [
+    `생성 ${items.length}장`,
+    h('button', { class: 'small ghost', title: '즐겨찾기(★)한 이미지는 남기고 지우기', onclick: () => {
+      const del = items.filter((i) => !i.fav);
+      if (!del.length) return toast('지울 이미지가 없어요 (모두 즐겨찾기)');
+      deleteItems(del, { title: `"${s?.name}" 씬에서 즐겨찾기 아닌 ${del.length}장을 지울까요?` });
+    } }, '🗑 즐겨찾기 빼고'),
+    h('button', { class: 'small ghost danger', onclick: () => deleteItems(items, { title: `"${s?.name}" 씬 이미지 ${items.length}장을 모두 지울까요?` }) }, '🗑 전부'),
+  ] : []));
+  el.querySelector('.scene-gallery').replaceChildren(...items.slice(0, 30).map((it) => {
     if (!urls.has(it.id)) urls.set(it.id, URL.createObjectURL(it.blob));
     const u = urls.get(it.id);
-    return h('img', { src: u, title: `seed ${it.request.seed}`, onclick: () => openLightbox(u, `${it.sceneName} · ${mixLabel(it.mix)} · seed ${it.request.seed}`) });
+    return h('div', { class: 'sg-item' + (it.fav ? ' fav' : '') },
+      h('img', { src: u, title: `seed ${it.request.seed}`, onclick: () => openLightbox(u, `${it.sceneName} · ${mixLabel(it.mix)} · seed ${it.request.seed}`) }),
+      h('button', { class: 'sg-fav', title: '즐겨찾기', onclick: async () => { it.fav = !it.fav; await history.put(it); fillGallery(el, id); } }, it.fav ? '★' : '☆'),
+      h('button', { class: 'sg-del', title: '지우기', onclick: () => deleteItems([it]) }, '✕'));
   }));
 }
 

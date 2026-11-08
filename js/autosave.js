@@ -68,6 +68,31 @@ function dateFolder(item) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+// 자동저장 폴더에 저장된 파일 지우기 (폴더 저장으로 저장된 것만). 반환: 지운 개수
+export async function removeSavedFiles(items) {
+  const targets = items.filter((it) => Array.isArray(it.savedRel));
+  if (!targets.length) return 0;
+  const dir = await getDir();
+  if (!dir) return 0;
+  let p = await dir.queryPermission({ mode: 'readwrite' });
+  if (p !== 'granted') p = await dir.requestPermission({ mode: 'readwrite' });
+  if (p !== 'granted') throw new Error('저장 폴더 권한이 없어서 파일은 지우지 못했어요');
+  let n = 0;
+  for (const it of targets) {
+    try {
+      let d = dir;
+      const parts = it.savedRel.slice();
+      const name = parts.pop();
+      for (const sub of parts) d = await d.getDirectoryHandle(sub);
+      await d.removeEntry(name);
+      n++;
+    } catch { /* 이미 없거나 옮겨진 파일 */ }
+  }
+  return n;
+}
+
+export const hasSavedFiles = (items) => items.some((it) => Array.isArray(it.savedRel));
+
 // 반환: 저장된 경로 문자열 또는 null
 export async function saveImage(item) {
   const mode = autosave.mode;
@@ -91,6 +116,7 @@ export async function saveImage(item) {
     const w = await fh.createWritable();
     await w.write(item.blob);
     await w.close();
+    item.savedRel = path.split('/'); // 나중에 파일까지 지울 때 사용
     return `${autosave.folderName}/${path}`;
   }
   // download

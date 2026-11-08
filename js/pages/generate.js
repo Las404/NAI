@@ -14,6 +14,7 @@ import { autosave, supportsFolder, chooseFolder } from '../autosave.js';
 import { local } from '../store.js';
 import { queue } from '../queue.js';
 import { startQueue, queueBar } from '../queueui.js';
+import { deleteItems } from '../remove.js';
 
 let root;
 let current = null; // 뷰어에 표시 중인 히스토리 항목
@@ -142,6 +143,17 @@ export function mount(el) {
   on('cost', (item) => { if (current && current.id === item.id) { current = item; renderInfo(); } });
   on('usage', updatePreview);
   on('autosave', renderAutosaveLabel);
+  on('deleted', ({ ids }) => {
+    for (const id of ids) { if (urls.has(id)) { URL.revokeObjectURL(urls.get(id)); urls.delete(id); } }
+    if (current && ids.has(current.id)) { current = null; renderViewer(); }
+    renderRecent(true);
+  });
+  document.addEventListener('keydown', (e) => {
+    // 생성 페이지에서 입력칸 밖이면 Delete 키로 지금 이미지 지우기
+    if (e.key !== 'Delete' || !current || document.body.dataset.page !== 'generate') return;
+    if (/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName) || document.querySelector('dialog[open]')) return;
+    deleteItems([current]);
+  });
   on('queue', () => { $('gMulti').disabled = queue.running; $('gGenerate').disabled = state.busy || queue.running; });
   renderAutosaveLabel();
 
@@ -361,7 +373,8 @@ function renderInfo() {
       h('button', { class: 'small ghost' + (it.fav ? ' fav-on' : ''), onclick: async () => { it.fav = !it.fav; await history.put(it); renderInfo(); } }, it.fav ? '★ 즐겨찾기' : '☆ 즐겨찾기'),
       h('button', { class: 'small ghost', title: '이 시드로 고정', onclick: () => { state.settings.seed = it.request.seed; state.settings.randomSeed = false; save.settings(); toast('시드를 고정했어요'); } }, '🔒 이 시드 고정'),
       h('button', { class: 'small ghost', onclick: () => { state.board.push({ id: crypto.randomUUID(), mix: cloneMix(it.mix), historyId: it.id }); save.board(); toast('비교 실험 보드에 추가했어요'); } }, '🧪 보드에 추가'),
-      h('button', { class: 'small ghost', onclick: () => restore(it) }, '↩ 이 설정 불러오기')));
+      h('button', { class: 'small ghost', onclick: () => restore(it) }, '↩ 이 설정 불러오기'),
+      h('button', { class: 'small ghost danger', title: '이 이미지 지우기 (Delete 키)', onclick: () => deleteItems([it]) }, '🗑 삭제')));
 }
 
 function restore(it) {

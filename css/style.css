@@ -265,6 +265,21 @@ dialog.lightbox .close { position: absolute; right: 12px; top: 12px; }
 .scene-gallery:empty { display: none; }
 .scene-gallery img { height: 76px; border-radius: 6px; cursor: zoom-in; flex: none; }
 
+/* 지우기·선택 */
+.danger-fill { background: var(--bad) !important; border-color: var(--bad) !important; color: #fff !important; }
+.sel-box { position: absolute; left: 6px; top: 6px; background: rgba(0,0,0,.6) !important; border: none !important; border-radius: 6px; padding: 0 6px; font-size: 16px; opacity: 0; transition: opacity .15s; }
+.card:hover .sel-box, .card.selected .sel-box { opacity: 1; }
+.card.selected { border-color: var(--bad); box-shadow: 0 0 0 2px rgba(239,111,108,.35); }
+.scene-tag { position: absolute; left: 6px; bottom: 6px; background: rgba(0,0,0,.65); padding: 1px 7px; border-radius: 999px; font-size: 11px; }
+.scount { display: inline-flex; gap: 6px; align-items: center; }
+.sg-item { position: relative; flex: none; }
+.sg-item img { display: block; }
+.sg-item.fav img { outline: 2px solid var(--accent); outline-offset: -2px; }
+.sg-item button { position: absolute; top: 3px; width: 20px; height: 20px; padding: 0; border-radius: 50%; border: none !important; background: rgba(0,0,0,.65) !important; font-size: 11px; opacity: 0; transition: opacity .15s; }
+.sg-item:hover button, .sg-item.fav .sg-fav { opacity: 1; }
+.sg-fav { left: 3px; color: var(--accent); }
+.sg-del { right: 3px; color: var(--bad); }
+
 /* 자동저장 */
 .on-accent { color: var(--accent) !important; border-color: #6b5228 !important; }
 .radio-card { display: flex; gap: 10px; align-items: flex-start; padding: 10px; border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; cursor: pointer; color: var(--text); font-size: 13px; }

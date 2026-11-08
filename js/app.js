@@ -1,5 +1,5 @@
 // 앱 시작: 페이지 라우팅(#/...), 상단 사용량 표시, 토큰 창
-import { $, h } from './ui.js';
+import { $, h, toast } from './ui.js';
 import { on, emit } from './state.js';
 import { token } from './store.js';
 import { usage, summarize, refreshUsage } from './usage.js';
@@ -88,6 +88,7 @@ function setupToken() {
 buildNav();
 setupToken();
 on('usage', renderPills);
+on('deleted', ({ message }) => toast(message, 'good'));
 window.addEventListener('hashchange', route);
 route();
 renderPills();
