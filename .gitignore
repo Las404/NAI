@@ -1,0 +1,5 @@
+# 수집 원본 데이터 (사이트는 assets/artists.json만 사용)
+data/
+.claude/
+Thumbs.db
+.DS_Store

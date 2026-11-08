@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>그깎 - NAI 그림체 깎기</title>
+  <meta name="description" content="NovelAI V5 작가 태그 조합으로 그림체를 깎는 도구">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🪚</text></svg>">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">🪚 그깎 <small>NAI 그림체 깎기</small></div>
+    <nav class="tabs">
+      <button data-tab="browse" class="active">작가 탐색</button>
+      <button data-tab="board">비교 보드</button>
+      <button data-tab="history">히스토리</button>
+    </nav>
+    <div class="top-right">
+      <span id="usage" class="badge muted">토큰 없음</span>
+      <button id="btnToken" class="ghost">🔑 API 토큰</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <main>
+      <!-- 작가 탐색 -->
+      <section id="tab-browse" class="tab active">
+        <div class="toolbar">
+          <input id="q" type="search" placeholder="작가 태그 검색 (예: ningen mame)" autocomplete="off">
+          <select id="gallery"></select>
+          <select id="sort">
+            <option value="score">추천순 (투표 신뢰도)</option>
+            <option value="up">좋아요 많은 순</option>
+            <option value="debated">호불호 갈리는 순</option>
+            <option value="name">이름순</option>
+          </select>
+          <label class="inline">최소 투표 <input id="minVotes" type="number" min="0" value="0" style="width:4.5em"></label>
+          <button id="btnShuffle" class="ghost">🎲 랜덤</button>
+        </div>
+        <p id="galleryNote" class="note"></p>
+        <div id="browseInfo" class="note"></div>
+        <div id="artistGrid" class="grid"></div>
+        <div id="pager" class="pager"></div>
+      </section>
+
+      <!-- 비교 보드 -->
+      <section id="tab-board" class="tab">
+        <div class="toolbar">
+          <button id="btnBoardAdd">＋ 현재 믹스 추가</button>
+          <span class="sep"></span>
+          <select id="sweepArtist" title="가중치를 바꿔볼 작가"></select>
+          <input id="sweepValues" value="0.6, 0.8, 1, 1.2, 1.4" title="가중치 목록 (쉼표로 구분)" style="width:12em">
+          <button id="btnSweep">가중치 스윕</button>
+          <button id="btnAblate" title="믹스에서 작가를 한 명씩 빼서 비교">한 명씩 빼보기</button>
+          <span class="sep"></span>
+          <button id="btnBoardNext" class="primary">▶ 다음 빈 칸 생성</button>
+          <button id="btnBoardClear" class="ghost danger">보드 비우기</button>
+        </div>
+        <p class="note">보드는 오른쪽 패널의 프롬프트·설정·<b>시드</b>를 그대로 쓰고 작가 믹스만 바꿔서 생성해요. 버튼 한 번에 한 장씩 생성돼요.</p>
+        <div id="boardGrid" class="grid board"></div>
+      </section>
+
+      <!-- 히스토리 -->
+      <section id="tab-history" class="tab">
+        <div class="toolbar">
+          <label class="inline"><input id="favOnly" type="checkbox"> 즐겨찾기만</label>
+          <span id="historyCount" class="note"></span>
+          <span class="sep"></span>
+          <button id="btnHistoryClear" class="ghost danger">기록 전체 삭제</button>
+        </div>
+        <div id="historyGrid" class="grid"></div>
+      </section>
+    </main>
+
+    <!-- 오른쪽 패널 -->
+    <aside class="side">
+      <div class="panel">
+        <div class="panel-head">
+          <h3>작가 믹스</h3>
+          <div class="row-gap">
+            <button id="btnRandomMix" class="ghost small" title="추천순 상위 작가 중 무작위 3명">🎲 3명</button>
+            <button id="btnClearMix" class="ghost small">비우기</button>
+          </div>
+        </div>
+        <div id="mixList" class="mix"></div>
+        <div class="row-gap">
+          <input id="addArtist" list="artistOptions" placeholder="작가 태그 직접 추가" autocomplete="off">
+          <datalist id="artistOptions"></datalist>
+          <button id="btnAddArtist" class="small">추가</button>
+        </div>
+        <div class="row-gap">
+          <select id="presetSelect"><option value="">프리셋 불러오기…</option></select>
+          <button id="btnSavePreset" class="small ghost">저장</button>
+          <button id="btnDelPreset" class="small ghost danger">삭제</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>프롬프트</h3>
+        <label>기본 프롬프트<textarea id="base" rows="2"></textarea></label>
+        <label>캐릭터 1 <small class="muted">(비우면 사용 안 함)</small><textarea id="character" rows="2"></textarea></label>
+        <div class="row-gap">
+          <label class="grow">복잡도
+            <select id="complexity">
+              <option value="">없음</option>
+              <option>low complexity</option>
+              <option>medium complexity</option>
+              <option>high complexity</option>
+              <option>ultra complexity</option>
+            </select>
+          </label>
+          <label class="grow">시대감
+            <select id="era">
+              <option value="">없음</option>
+              <option>meta:novel era</option>
+              <option>meta:golden era</option>
+            </select>
+          </label>
+        </div>
+        <label class="inline"><input id="quality" type="checkbox"> 품질 태그 붙이기</label>
+        <label>네거티브 <small class="muted">(Medium effort에선 무시됨)</small><textarea id="negative" rows="3"></textarea></label>
+        <details>
+          <summary>최종 프롬프트 보기</summary>
+          <pre id="finalPrompt" class="code"></pre>
+          <button id="btnCopyPrompt" class="small ghost">복사</button>
+        </details>
+      </div>
+
+      <div class="panel">
+        <h3>생성 설정</h3>
+        <label>모델<select id="model"></select></label>
+        <div class="row-gap">
+          <label class="grow">크기
+            <select id="size">
+              <option value="832x1216">832×1216 세로</option>
+              <option value="1216x832">1216×832 가로</option>
+              <option value="1024x1024">1024×1024 정사각</option>
+              <option value="640x960">640×960 작은 세로 (빠른 탐색)</option>
+              <option value="1024x1536">1024×1536 큰 세로 (Anlas 소모)</option>
+            </select>
+          </label>
+          <label>스텝<input id="steps" type="number" min="1" max="50" style="width:4.5em"></label>
+        </div>
+        <div class="row-gap">
+          <label class="grow">CFG<input id="scale" type="number" step="0.1" min="0" max="10"></label>
+          <label class="grow">Rescale<input id="cfgRescale" type="number" step="0.02" min="0" max="1"></label>
+        </div>
+        <label>샘플러<select id="sampler"></select></label>
+        <div class="row-gap">
+          <label class="grow">시드<input id="seed" type="number" min="0" max="4294967295"></label>
+          <button id="btnNewSeed" class="small ghost" title="새 시드">🎲</button>
+        </div>
+        <label class="inline"><input id="randomSeed" type="checkbox"> 생성할 때마다 새 시드 (비교 보드는 항상 고정)</label>
+      </div>
+
+      <div class="panel sticky-gen">
+        <div id="costBadge" class="badge"></div>
+        <div class="row-gap">
+          <button id="btnGenerate" class="primary grow">생성</button>
+          <button id="btnToBoard" class="ghost" title="현재 믹스를 비교 보드에 추가">보드에 추가</button>
+        </div>
+        <div id="status" class="note"></div>
+        <div id="lastResult" class="last"></div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- 토큰 모달 -->
+  <dialog id="tokenDialog">
+    <form method="dialog">
+      <h3>NovelAI API 토큰</h3>
+      <p class="note">NovelAI 웹 → 설정(⚙) → Account → <b>Get Persistent API Token</b> 에서 받을 수 있어요.<br>
+        토큰은 이 브라우저에만 저장되고, <code>image.novelai.net</code> 외의 곳으로는 보내지 않아요.</p>
+      <input id="tokenInput" type="password" placeholder="pst-..." autocomplete="off" style="width:100%">
+      <label class="inline"><input id="tokenRemember" type="checkbox"> 이 기기에 기억하기 (체크 안 하면 탭을 닫을 때 지워져요)</label>
+      <div class="row-gap end">
+        <button value="clear" class="ghost danger">토큰 지우기</button>
+        <button value="cancel" class="ghost">취소</button>
+        <button value="save" class="primary">저장</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- 이미지 크게 보기 -->
+  <dialog id="lightbox" class="lightbox">
+    <form method="dialog"><button class="close">✕</button></form>
+    <img id="lightboxImg" alt="">
+    <div id="lightboxCaption" class="note"></div>
+  </dialog>
+
+  <footer class="foot">
+    작가 샘플 이미지·투표 데이터: <a href="https://nax.moe" target="_blank" rel="noopener">NovelAI Tag Experiments (nax.moe)</a> by Zelest,
+    <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>.
+    NovelAI·Anlatan과 관련 없는 개인 프로젝트예요.
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
