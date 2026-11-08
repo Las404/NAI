@@ -1,6 +1,7 @@
 // 자동 그림체 튜너 엔진
 // 예시 이미지 → (Claude 분석 + CLIP 후보) → [K장 생성 → CLIP 점수 → Claude 평가·다음 후보] 반복 → 최종 프롬프트·네거티브·설정
-import { state, emit } from './state.js';
+import { state, emit, DEFAULT_NEG } from './state.js';
+import { extractArtists, fmtWeight } from './prompt.js';
 import { MODELS, SAMPLERS } from './nai.js';
 import { generateRaw } from './generator.js';
 import { usage, summarize } from './usage.js';
@@ -87,7 +88,7 @@ const FINAL_SCHEMA = {
 // ───────── 상태 ─────────
 export const tuner = {
   run: null,
-  get running() { return !!this.run && ['analyzing', 'generating', 'judging', 'validating'].includes(this.run.status); },
+  get running() { return !!this.run && ['analyzing', 'generating', 'judging', 'validating', 'picking'].includes(this.run.status); },
 };
 const emitT = () => emit('tuner');
 const log = (msg, kind = '') => { tuner.run.log.unshift({ time: Date.now(), msg, kind }); emitT(); };
@@ -128,12 +129,15 @@ function requestFor(run, cand, seed) {
   };
 }
 
-// 종합 점수: Claude 점수(0~10) 70% + CLIP 유사도(이번 실행 안에서 0~1로 정규화) 30%
+// 종합 점수
+//  - Claude 두뇌: Claude 점수(0~10) 70% + CLIP 유사도(이번 실행 안에서 0~1 정규화) 30%
+//  - CLIP 두뇌: CLIP 유사도(정규화) + 내가 👍한 후보 보너스 1
 export function scoreOf(run, cand) {
   const clips = run.cands.flatMap((c) => c.images.map((i) => i.clip)).filter((x) => x != null);
   const lo = Math.min(...clips), hi = Math.max(...clips);
   const clip = cand.images.length ? cand.images.reduce((a, i) => a + i.clip, 0) / cand.images.length : null;
   const clipN = clip == null || hi === lo ? 0.5 : (clip - lo) / (hi - lo);
+  if (run.brain === 'clip') return { total: clipN + (cand.picked ? 1 : 0), clip, clipN };
   const cl = cand.claude == null ? null : cand.claude / 10;
   return { total: cl == null ? clipN * 0.3 : cl * 0.7 + clipN * 0.3, clip, clipN };
 }
@@ -173,6 +177,8 @@ export function createRun(opts) {
     seeds: [randSeed(), randSeed()],
     used: 0, round: 0, cost: 0,
     cands: [], pending: [], rounds: [], analysis: '', clipHints: '', final: null, log: [],
+    brain: opts.brain || 'clip', humanPick: !!opts.humanPick, waitingPick: false,
+    startSettings: opts.startSettings || null, // CLIP 두뇌 + 현재 프롬프트 출발일 때 설정
   };
 }
 
@@ -180,9 +186,15 @@ export async function startRun(run) {
   tuner.run = run;
   state.lock = 'tuner';
   try {
-    if (!run.refVec) await analyze(run);
-    await loop(run);
-    if (!run.stopping && !run.error) await finish(run);
+    if (run.brain === 'clip') {
+      if (!run.refVec) await clipAnalyze(run);
+      await clipLoop(run);
+      if (!run.stopping && !run.error) await clipFinish(run);
+    } else {
+      if (!run.refVec) await analyze(run);
+      await loop(run);
+      if (!run.stopping && !run.error) await finish(run);
+    }
   } catch (e) {
     run.error = e.message;
     run.status = 'error';
@@ -197,7 +209,11 @@ export async function startRun(run) {
 }
 
 export function stopRun() {
-  if (tuner.run && tuner.running) { tuner.run.stopping = true; log('정지 요청 — 지금 단계가 끝나면 멈춰요'); }
+  if (tuner.run && tuner.running) {
+    tuner.run.stopping = true;
+    log('정지 요청 — 지금 단계가 끝나면 멈춰요');
+    if (tuner.run.pickResolve) tuner.run.pickResolve();
+  }
 }
 
 async function analyze(run) {
@@ -420,3 +436,274 @@ export async function historyItemsOf(run) {
 }
 
 export { ClaudeError };
+
+// ═════════════════════════ CLIP 두뇌 (무료) ═════════════════════════
+// 점수 = 예시와 생성 이미지의 CLIP 그림체 유사도. 모든 라운드가 같은 시드라 서로 비교 가능.
+// 단계: ① 작가 단독 시험 → ② 작가 조합·가중치 진화 → ③ 화풍 태그 넣고 빼기 → ④ 설정·부정 프롬프트 → ⑤ 새 시드로 검증
+
+let contentGroupsPromise;
+const loadContentGroups = () => (contentGroupsPromise ||= fetch(new URL('../assets/content-tags.json', import.meta.url)).then((r) => r.json()).then((j) => j.groups));
+
+// 예시 이미지 분석 (시작 전에 미리 볼 수 있게 export): 내용 프롬프트 추정 + 작가 후보 + 화풍 힌트
+export async function analyzeReference(blob) {
+  const [styleGroups, contentGroups] = await Promise.all([loadStyleGroups(), loadContentGroups()]);
+  const res = await analyzeImage(blob, { exclude: state.hidden, groups: [...styleGroups, ...contentGroups] });
+  const content = [];
+  for (const g of contentGroups) {
+    const list = res.styles[g.id];
+    if (!list?.length) continue;
+    // CLIP 추정은 틀릴 수 있어서, 확실히 두드러질 때만 넣음 (틀린 태그보다 빠진 태그가 나음)
+    const need = g.id === 'c_frame' ? 1.2 : ['c_clothes', 'c_bg'].includes(g.id) ? 2.1 : 1.6;
+    for (const s of list.slice(0, g.pick)) if (s.score > need) content.push(s.tag);
+  }
+  const styleHints = [];
+  for (const g of styleGroups) {
+    const list = res.styles[g.id];
+    if (!list) continue;
+    for (const s of list.slice(0, 2)) if (s.score > 1.2) styleHints.push(s.tag);
+  }
+  return { content: content.join(', '), artists: res.artists, styleHints };
+}
+
+const QUALITY_DEFAULT = 'masterpiece, best quality, very aesthetic, absurdres';
+const tok = (t, w) => (Math.abs(w - 1) < 1e-6 ? t : `${fmtWeight(w)}::${t}::`);
+const pickRand = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const round2 = (x) => Math.round(x * 20) / 20;
+
+function specToCand(spec, id, round, rationale) {
+  const style = join(
+    spec.artists.map((a) => tok(`artist:${a.tag}`, a.w)).join(', '),
+    spec.tags.map((t) => tok(t.tag, t.w)).join(', '),
+    spec.extra,
+  );
+  return {
+    id, round, rationale, spec: JSON.parse(JSON.stringify(spec)),
+    style_prompt: style, negative_prompt: spec.negative,
+    scale: spec.scale, cfg_rescale: spec.cfg_rescale, steps: spec.steps, sampler: spec.sampler,
+    images: [], claude: null, note: '',
+  };
+}
+
+const specKey = (s) => JSON.stringify([s.artists.map((a) => [a.tag, a.w]).sort(), s.tags.map((t) => [t.tag, t.w]).sort(), s.extra, s.negative, s.scale, s.cfg_rescale, s.steps, s.sampler]);
+
+async function clipAnalyze(run) {
+  run.status = 'analyzing';
+  log('예시 이미지 분석 중 (CLIP)…');
+  const bmp = await createImageBitmap(run.refBlob);
+  [run.width, run.height] = sizeFor(bmp.width, bmp.height);
+  run.refVec = await embedStyle(run.refBlob);
+  const ref = await analyzeReference(run.refBlob);
+  if (!run.content) run.content = ref.content;
+  run.artistPool = ref.artists.slice(0, 40).map((a) => a.tag);
+  run.styleHints = ref.styleHints;
+  run.analysis = `CLIP 추정 — 비슷한 작가: ${run.artistPool.slice(0, 8).join(', ')} … / 두드러진 화풍: ${ref.styleHints.join(', ') || '없음'}`;
+
+  // 출발 스펙
+  if (run.mode === 'current') {
+    const { mix, rest } = extractArtists(run.startPos || '');
+    const st = run.startSettings || {};
+    run.base = {
+      artists: mix.map((a) => ({ tag: a.tag, w: a.weight })), tags: [], extra: rest || QUALITY_DEFAULT,
+      negative: run.startNeg || DEFAULT_NEG,
+      scale: clamp(st.scale, 1, 10, 5), cfg_rescale: clamp(st.cfgRescale, 0, 1, 0), steps: Math.round(clamp(st.steps, 10, 28, 28)),
+      sampler: SAMPLERS.includes(st.sampler) ? st.sampler : 'k_euler_ancestral',
+    };
+  } else {
+    run.base = { artists: [], tags: [], extra: QUALITY_DEFAULT, negative: DEFAULT_NEG, scale: 5, cfg_rescale: 0, steps: 28, sampler: 'k_euler_ancestral' };
+  }
+  run.seen = new Set();
+  run.screened = []; // 작가 단독 점수 [{ tag, clip }]
+  const reserve = run.budget >= 30 ? Math.min(6, Math.floor(run.budget * 0.1)) : 0;
+  const avail = run.budget - reserve;
+  run.plan = {
+    reserve,
+    screen: Math.max(run.batch, Math.round(avail * 0.3)),
+    mix: Math.round(avail * 0.35),
+    tags: Math.round(avail * 0.15),
+  };
+  run.round = 0;
+  log(`분석 완료 · 내용 프롬프트: ${run.content}`, 'good');
+}
+
+function bestSpec(run) {
+  const top = leaderboard(run, 1)[0];
+  return top?.c.spec ? JSON.parse(JSON.stringify(top.c.spec)) : JSON.parse(JSON.stringify(run.base));
+}
+
+// 현재 단계에 맞는 후보 k개 만들기
+function nextBatch(run, k) {
+  const used = run.used;
+  const { screen, mix, tags } = run.plan;
+  const out = [];
+  const push = (spec, why) => {
+    const key = specKey(spec);
+    if (run.seen.has(key) || out.length >= k) return;
+    run.seen.add(key);
+    out.push({ spec, why });
+  };
+  const base = run.base;
+
+  if (used < screen) {
+    run.phase = '① 작가 단독 시험';
+    if (!run.cands.length && base.artists.length) push(JSON.parse(JSON.stringify(base)), '출발점 (지금 프롬프트)');
+    const tried = new Set(run.screened.map((s) => s.tag));
+    for (const tag of run.artistPool) {
+      if (out.length >= k) break;
+      if (tried.has(tag)) continue;
+      push({ ...JSON.parse(JSON.stringify(base)), artists: [{ tag, w: 1 }] }, `작가 단독: ${tag}`);
+    }
+    if (out.length) return out;
+  }
+  const topArtists = run.screened.slice().sort((a, b) => b.clip - a.clip).slice(0, 6).map((s) => s.tag);
+  if (used < screen + mix && topArtists.length) {
+    run.phase = '② 작가 조합·가중치';
+    const best = bestSpec(run);
+    let guard = 0;
+    while (out.length < k && guard++ < 200) {
+      const r = Math.random();
+      if (r < 0.4 || best.artists.length < 2) {
+        // 새 조합: 상위 작가 2~4명, 가중치 0.4~1.2
+        const n = 2 + Math.floor(Math.random() * 3);
+        const pool = topArtists.slice();
+        const artists = [];
+        while (artists.length < n && pool.length) {
+          const t = pool.splice(Math.floor(Math.random() * Math.min(pool.length, 4)), 1)[0];
+          artists.push({ tag: t, w: round2(0.4 + Math.random() * 0.8) });
+        }
+        push({ ...best, artists }, `새 조합 ${artists.map((a) => a.tag).join(' + ')}`);
+      } else {
+        // 최고 후보 변형: 가중치 조정 / 한 명 빼기 / 한 명 추가
+        const s = JSON.parse(JSON.stringify(best));
+        const m = Math.random();
+        if (m < 0.55) {
+          const a = pickRand(s.artists);
+          a.w = round2(clamp(a.w + pickRand([-0.3, -0.2, -0.1, 0.1, 0.2, 0.3]), 0.2, 1.5, 1));
+          push(s, `가중치 조정 ${a.tag} → ${a.w}`);
+        } else if (m < 0.75 && s.artists.length > 1) {
+          const i = Math.floor(Math.random() * s.artists.length);
+          const [gone] = s.artists.splice(i, 1);
+          push(s, `빼보기 ${gone.tag}`);
+        } else {
+          const cand = topArtists.filter((t) => !s.artists.some((a) => a.tag === t));
+          if (cand.length && s.artists.length < 5) {
+            const t = pickRand(cand);
+            s.artists.push({ tag: t, w: round2(0.3 + Math.random() * 0.5) });
+            push(s, `더해보기 ${t}`);
+          }
+        }
+      }
+    }
+    return out;
+  }
+  if (used < screen + mix + tags) {
+    run.phase = '③ 화풍 태그';
+    const best = bestSpec(run);
+    const hints = [...(run.styleHints || []), 'high complexity', 'ultra complexity', 'depthness', 'meta:golden era'];
+    for (const tag of hints) {
+      if (best.tags.some((t) => t.tag === tag) || best.extra.includes(tag)) continue;
+      push({ ...best, tags: [...best.tags, { tag, w: 1 }] }, `태그 더하기: ${tag}`);
+      push({ ...best, tags: [...best.tags, { tag, w: 1.3 }] }, `태그 강하게: ${tag}`);
+    }
+    for (const t of best.tags) push({ ...best, tags: best.tags.filter((x) => x !== t) }, `태그 빼기: ${t.tag}`);
+    if (out.length) return out.slice(0, k);
+  }
+  run.phase = '④ 설정·부정 프롬프트';
+  const best = bestSpec(run);
+  const variants = [
+    { scale: round2(best.scale - 1) }, { scale: round2(best.scale + 1) }, { scale: round2(best.scale - 0.5) }, { scale: round2(best.scale + 0.5) },
+    { cfg_rescale: 0 }, { cfg_rescale: 0.2 }, { cfg_rescale: 0.4 },
+    { steps: best.steps === 28 ? 23 : 28 },
+    { sampler: 'k_euler_ancestral' }, { sampler: 'k_dpmpp_2m_sde' }, { sampler: 'k_euler' }, { sampler: 'k_dpmpp_2s_ancestral' },
+    { negative: DEFAULT_NEG }, { negative: run.startNeg || DEFAULT_NEG }, { negative: join(best.negative, 'monochrome, greyscale, sketch') },
+  ];
+  for (const v of variants.sort(() => Math.random() - 0.5)) {
+    const s = { ...best, ...v };
+    s.scale = clamp(s.scale, 2, 9, 5);
+    push(s, '설정 ' + Object.entries(v).map(([a, b]) => `${a}=${typeof b === 'string' && b.length > 20 ? b.slice(0, 20) + '…' : b}`).join(', '));
+  }
+  return out;
+}
+
+async function clipLoop(run) {
+  const seed = run.seeds[0];
+  while (!run.stopping) {
+    const left = run.budget - run.plan.reserve - run.used;
+    if (left <= 0) break;
+    let cands = run.pending;
+    if (!cands.length) {
+      run.round++;
+      cands = nextBatch(run, Math.min(run.batch, left)).map((b, i) => specToCand(b.spec, `r${run.round}c${i + 1}`, run.round, `${run.phase} · ${b.why}`));
+      if (!cands.length) { log('더 시험할 후보가 없어요'); break; }
+    }
+    run.pending = [];
+    run.cands.push(...cands);
+    run.status = 'generating';
+    emitT();
+    await renderCands(run, cands, () => seed);
+    // 작가 단독 결과 기록
+    for (const c of cands) if (c.images.length && c.spec.artists.length === 1 && c.rationale.includes('작가 단독')) run.screened.push({ tag: c.spec.artists[0].tag, clip: c.images[0].clip });
+    if (run.stopping) {
+      const undone = cands.filter((c) => !c.images.length);
+      run.cands = run.cands.filter((c) => !undone.includes(c));
+      for (const c of undone) run.seen.delete(specKey(c.spec));
+      run.pending = undone;
+      break;
+    }
+    const top = leaderboard(run, 1)[0];
+    run.rounds.push({ round: run.round, critique: `${run.phase} — 이번 라운드 최고 CLIP ${Math.max(...cands.filter((c) => c.images.length).map((c) => c.images[0].clip)).toFixed(3)}` });
+    log(`라운드 ${run.round} (${run.phase}) 끝 · 현재 1위 ${top?.c.id} CLIP ${top?.s.clip?.toFixed(3)}`, 'good');
+    if (run.humanPick && run.budget - run.plan.reserve - run.used > 0) {
+      run.status = 'picking';
+      run.waitingPick = true;
+      log('👍 마음에 드는 이미지를 고르고 "다음 라운드"를 눌러주세요');
+      emitT();
+      await new Promise((res) => { run.pickResolve = res; });
+      run.pickResolve = null;
+      run.waitingPick = false;
+    }
+  }
+}
+
+// 사람이 고른 후보 표시 (👍 토글)
+export function togglePick(run, candId) {
+  const c = run.cands.find((x) => x.id === candId);
+  if (!c) return;
+  c.picked = !c.picked;
+  emitT();
+}
+export function resolvePick(run) { if (run.pickResolve) run.pickResolve(); }
+
+async function clipFinish(run) {
+  const board = leaderboard(run, 3);
+  if (!board.length) return;
+  const left = run.budget - run.used;
+  if (left >= 2 && board.length >= 2) {
+    run.status = 'validating';
+    run.phase = '⑤ 새 시드로 검증';
+    log(`검증: 상위 ${board.length}개 후보를 새 시드로 다시 생성`);
+    const vc = [];
+    for (const seed of run.seeds.slice(1).concat([randSeed()])) for (const { c } of board) vc.push({ c, seed });
+    for (const { c, seed } of vc.slice(0, left)) {
+      if (run.stopping) break;
+      await renderCands(run, [c], () => seed);
+    }
+  }
+  if (run.stopping) return;
+  // 여러 시드 평균이 가장 높은 후보 (👍 우선)
+  const ranked = leaderboard(run, 3);
+  const win = ranked[0].c;
+  run.final = { ...win, id: 'final', winner: win.id };
+  const sp = win.spec;
+  run.final.summary = [
+    `우승 ${win.id} (CLIP 평균 ${ranked[0].s.clip.toFixed(3)}, ${win.images.length}장 기준${win.picked ? ', 👍 선택' : ''})`,
+    `작가: ${sp.artists.map((a) => `${a.tag}${a.w !== 1 ? ' ×' + a.w : ''}`).join(', ') || '없음'}`,
+    sp.tags.length ? `더한 화풍 태그: ${sp.tags.map((t) => t.tag).join(', ')}` : null,
+    `설정: CFG ${sp.scale} · Rescale ${sp.cfg_rescale} · ${sp.steps}스텝 · ${sp.sampler}`,
+    'CLIP은 그림체를 숫자로만 비교해서, 눈매나 선 굵기 같은 세부는 놓칠 수 있어요. 결과를 보고 👍 고르기나 비교 실험으로 다듬어 보세요.',
+  ].filter(Boolean).join('\n');
+  run.status = 'done';
+  log(`완료! 우승 ${win.id} · 생성 ${run.used}장`, 'good');
+  const saved = JSON.parse(localStorage.getItem('gk.tunerResults') || '[]');
+  saved.unshift({ time: Date.now(), runId: run.id, brain: 'clip', style_prompt: win.style_prompt, negative_prompt: win.negative_prompt, scale: win.scale, cfg_rescale: win.cfg_rescale, steps: win.steps, sampler: win.sampler, lockedPos: run.lockedPos, lockedNeg: run.lockedNeg, model: run.model });
+  localStorage.setItem('gk.tunerResults', JSON.stringify(saved.slice(0, 30)));
+}

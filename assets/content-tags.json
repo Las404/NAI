@@ -1,0 +1,14 @@
+{
+  "note": "자동 튜너가 예시 이미지의 내용(인물·구도·배경)을 CLIP으로 추정할 때 쓰는 태그. pick = 그룹에서 고를 최대 개수",
+  "groups": [
+    { "id": "c_count", "label": "인물 수", "pick": 1, "tags": [["1girl, solo", ""], ["1boy, solo", ""], ["2girls", ""], ["1boy, 1girl", ""], ["2boys", ""], ["multiple girls", ""], ["no humans", ""]] },
+    { "id": "c_hair", "label": "머리색", "pick": 1, "tags": [["black hair", ""], ["brown hair", ""], ["blonde hair", ""], ["white hair", ""], ["grey hair", ""], ["silver hair", ""], ["red hair", ""], ["pink hair", ""], ["purple hair", ""], ["blue hair", ""], ["light blue hair", ""], ["green hair", ""], ["orange hair", ""], ["multicolored hair", ""]] },
+    { "id": "c_hairlen", "label": "머리 길이", "pick": 1, "tags": [["short hair", ""], ["medium hair", ""], ["long hair", ""], ["very long hair", ""], ["ponytail", ""], ["twintails", ""]] },
+    { "id": "c_eyes", "label": "눈색", "pick": 1, "tags": [["blue eyes", ""], ["red eyes", ""], ["green eyes", ""], ["brown eyes", ""], ["purple eyes", ""], ["yellow eyes", ""], ["pink eyes", ""], ["grey eyes", ""], ["aqua eyes", ""], ["black eyes", ""], ["closed eyes", ""]] },
+    { "id": "c_frame", "label": "구도", "pick": 1, "tags": [["portrait", ""], ["upper body", ""], ["cowboy shot", ""], ["full body", ""], ["close-up", ""]] },
+    { "id": "c_view", "label": "시점", "pick": 1, "tags": [["looking at viewer", ""], ["looking away", ""], ["from side", ""], ["from behind", ""], ["from above", ""], ["from below", ""]] },
+    { "id": "c_expr", "label": "표정", "pick": 1, "tags": [["smile", ""], ["closed mouth", ""], ["open mouth", ""], ["expressionless", ""], ["blush", ""], ["serious", ""], ["crying", ""]] },
+    { "id": "c_clothes", "label": "옷", "pick": 2, "tags": [["school uniform", ""], ["serafuku", ""], ["dress", ""], ["suit", ""], ["necktie", ""], ["shirt", ""], ["hoodie", ""], ["jacket", ""], ["coat", ""], ["sweater", ""], ["kimono", ""], ["maid", ""], ["armor", ""], ["swimsuit", ""], ["bikini", ""], ["military uniform", ""], ["t-shirt", ""], ["skirt", ""], ["pants", ""], ["hat", ""], ["gloves", ""], ["fantasy clothes", ""]] },
+    { "id": "c_bg", "label": "배경", "pick": 2, "tags": [["simple background", ""], ["white background", ""], ["gradient background", ""], ["outdoors", ""], ["indoors", ""], ["city", ""], ["night", ""], ["sky", ""], ["cloud", ""], ["nature", ""], ["forest", ""], ["flower", ""], ["water", ""], ["beach", ""], ["room", ""], ["classroom", ""], ["street", ""], ["neon lights", ""], ["sunset", ""], ["snow", ""], ["rain", ""]] }
+  ]
+}

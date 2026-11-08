@@ -6,13 +6,15 @@ import { token, local } from '../store.js';
 import { usageStats } from '../usage.js';
 import { claudeKey, CLAUDE_MODEL } from '../claude.js';
 import { hasClipData } from '../clip.js';
-import { tuner, createRun, startRun, stopRun, continueRun, leaderboard, scoreOf, MAX_BUDGET } from '../tuner.js';
+import { tuner, createRun, startRun, stopRun, continueRun, leaderboard, MAX_BUDGET, analyzeReference, togglePick, resolvePick } from '../tuner.js';
 import { ensureAck } from '../queueui.js';
 import { queue } from '../queue.js';
 import { prepareAutosave } from '../autosave.js';
 
 let refBlob = null;
 const opt = {
+  brain: local.get('tunerBrain', 'clip'),
+  humanPick: local.get('tunerHumanPick', false),
   mode: local.get('tunerMode', 'current'),
   budget: local.get('tunerBudget', 80),
   batch: local.get('tunerBatch', 8),
@@ -27,14 +29,20 @@ export function mount(el) {
       h('div', { class: 'tu-left' },
         h('div', { class: 'panel' },
           h('h3', {}, '🎛 자동 그림체 튜너'),
-          h('p', { class: 'note' }, '예시 이미지를 올리면 Claude가 그림체를 분석하고, 내 NAI 계정으로 여러 장을 직접 뽑아보면서 예시와 비교해 ',
+          h('p', { class: 'note' }, '예시 이미지를 올리면 내 NAI 계정으로 여러 장을 직접 뽑아보면서 예시와 비교해 ',
             h('b', {}, '메인 프롬프트(작가·화풍·퀄리티), 부정 프롬프트, 설정(CFG·Rescale·스텝·샘플러)'), '을 깎아요.')),
         h('div', { id: 'tuDrop', class: 'dropzone' },
           h('div', { id: 'tuRef' }, h('div', { class: 'big-emoji' }, '🖼️'), h('div', {}, '예시 이미지를 끌어다 놓거나')),
           h('button', { class: 'primary', onclick: () => pickFile('image/*', setRef) }, '이미지 고르기'),
           h('div', { class: 'note' }, '붙여넣기(Ctrl+V)도 돼요')),
         h('div', { class: 'panel' },
-          h('div', { class: 'row-gap tight' }, h('b', {}, 'Claude API 키'), h('span', { id: 'tuKey', class: 'note' }), h('span', { class: 'grow' }), h('button', { class: 'small', onclick: openKey }, '🔑 설정')),
+          h('h3', {}, '두뇌'),
+          radio('brain', 'clip', '무료 · CLIP 자동', '예시와 결과의 그림체 유사도(CLIP)로 자동 탐색해요. 추가 결제 없음.'),
+          radio('brain', 'claude', '유료 · Claude API', 'Claude가 이미지를 직접 보고 비교·수정해요. Anthropic API 키와 결제가 필요해요.'),
+          h('label', { class: 'inline', style: { marginTop: '6px' } },
+            h('input', { type: 'checkbox', checked: opt.humanPick, onchange: (e) => { opt.humanPick = e.target.checked; local.set('tunerHumanPick', opt.humanPick); } }),
+            '라운드마다 멈추고 내가 👍 고르기 (CLIP 모드)'),
+          h('div', { class: 'row-gap tight', id: 'tuKeyRow' }, h('b', {}, 'Claude API 키'), h('span', { id: 'tuKey', class: 'note' }), h('span', { class: 'grow' }), h('button', { class: 'small', onclick: openKey }, '🔑 설정')),
           h('div', { class: 'row-gap tight' }, h('b', {}, 'NAI 토큰'), h('span', { id: 'tuNai', class: 'note' })),
           h('div', { class: 'row-gap tight' }, h('b', {}, '그림체 분석 데이터'), h('span', { id: 'tuClip', class: 'note' }))),
         h('div', { class: 'panel' },
@@ -43,7 +51,9 @@ export function mount(el) {
           radio('mode', 'fresh', '예시 이미지만 보고 새로 짜기', '처음부터 새로 설계해요.'),
           h('label', {}, '항상 넣을 태그 (메인)', h('textarea', { rows: 2, value: opt.lockedPos, oninput: (e) => { opt.lockedPos = e.target.value; local.set('tunerLockedPos', opt.lockedPos); } })),
           h('label', {}, '항상 넣을 태그 (부정)', h('textarea', { rows: 2, value: opt.lockedNeg, placeholder: '예: nsfw', oninput: (e) => { opt.lockedNeg = e.target.value; local.set('tunerLockedNeg', opt.lockedNeg); } })),
-          h('label', {}, '내용 프롬프트 (선택)', h('textarea', { rows: 2, placeholder: '비우면 Claude가 예시 이미지의 인물·구도를 태그로 적어요. 비교를 공정하게 하려고 모든 후보가 같은 내용을 그려요.', oninput: (e) => { opt.content = e.target.value; } }))),
+          h('label', {}, '내용 프롬프트 (비교용)', h('textarea', { id: 'tuContent', rows: 3, placeholder: '비우면 예시 이미지의 인물·구도·배경을 자동으로 추정해요. 모든 후보가 같은 내용을 그려야 그림체만 공정하게 비교돼요.', oninput: (e) => { opt.content = e.target.value; } })),
+          h('button', { class: 'small', onclick: preview }, '🔍 예시 분석해서 채우기'),
+          h('div', { id: 'tuPreview', class: 'note' })),
         h('div', { class: 'panel' },
           h('h3', {}, '예산'),
           h('label', {}, '생성 장수 ', h('b', { id: 'tuBudgetV' }, opt.budget), `장 (최대 ${MAX_BUDGET})`,
@@ -73,10 +83,24 @@ export function show() { status(); estimate(); render(); }
 function radio(name, value, title, desc) {
   return h('label', { class: 'radio-card' + (opt[name] === value ? ' on' : '') },
     h('input', { type: 'radio', name: 'tu-' + name, checked: opt[name] === value, onchange: () => {
-      opt[name] = value; local.set('tunerMode', value);
+      opt[name] = value; local.set(name === 'brain' ? 'tunerBrain' : 'tunerMode', value);
       document.querySelectorAll(`input[name=tu-${name}]`).forEach((r) => r.closest('.radio-card').classList.toggle('on', r.checked));
+      status(); estimate();
     } }),
     h('div', {}, h('b', {}, title), h('div', { class: 'note' }, desc)));
+}
+
+async function preview() {
+  if (!refBlob) return toast('예시 이미지를 먼저 올려주세요');
+  $('tuPreview').textContent = '분석 중… (처음엔 CLIP 모델을 받느라 조금 걸려요)';
+  try {
+    const r = await analyzeReference(refBlob);
+    opt.content = r.content;
+    $('tuContent').value = r.content;
+    $('tuPreview').textContent = `비슷한 작가: ${r.artists.slice(0, 8).map((a) => a.tag).join(', ')} · 두드러진 화풍: ${r.styleHints.join(', ') || '없음'}`;
+  } catch (e) {
+    $('tuPreview').textContent = '분석 실패: ' + e.message;
+  }
 }
 
 function setRef(file) {
@@ -87,6 +111,7 @@ function setRef(file) {
 
 async function status() {
   if (!$('tuKey')) return;
+  $('tuKeyRow').hidden = opt.brain !== 'claude';
   $('tuKey').textContent = claudeKey.get() ? `✓ 있음 (${CLAUDE_MODEL})` : '없음';
   $('tuKey').className = 'note ' + (claudeKey.get() ? 'good-text' : 'bad');
   $('tuNai').textContent = token.get() ? '✓ 있음' : '없음 (오른쪽 위 🔑)';
@@ -99,7 +124,9 @@ function estimate() {
   const st = usageStats();
   const rounds = Math.ceil(opt.budget / opt.batch) + 2;
   const battery = st.avgPercent ? `V5 배터리 약 ${(st.avgPercent * opt.budget).toFixed(0)}%` : 'V5 배터리 소모는 기록이 쌓이면 표시';
-  $('tuEst').textContent = `라운드 약 ${rounds}번 · ${battery} · Claude 비용 대략 $${(rounds * 0.12).toFixed(1)}~${(rounds * 0.25).toFixed(1)} (Opus 5.5 기준 추정)`;
+  $('tuEst').textContent = opt.brain === 'claude'
+    ? `라운드 약 ${rounds}번 · ${battery} · Claude 비용 대략 $${(rounds * 0.12).toFixed(1)}~${(rounds * 0.25).toFixed(1)} (Opus 5.5 기준 추정)`
+    : `라운드 약 ${rounds}번 · ${battery} · 추가 비용 없음 (CLIP은 브라우저에서 계산)`;
 }
 
 function openKey() {
@@ -125,11 +152,12 @@ async function start() {
   if (state.busy || queue.running) return toast('다른 생성이 진행 중이에요');
   if (!refBlob) return toast('예시 이미지를 먼저 올려주세요');
   if (!token.get()) { emit('needToken'); return; }
-  if (!claudeKey.get()) return openKey();
+  if (opt.brain === 'claude' && !claudeKey.get()) return openKey();
   await prepareAutosave();
   if (!(await ensureAck())) return;
   const s = state.settings;
-  const msg = `${opt.budget}장까지 ${queue.delay}초 간격으로 자동 생성하면서 Claude(${CLAUDE_MODEL})로 평가해요.\n크기는 예시 비율에 맞춰 832×1216 / 1216×832 / 1024×1024 중에서 골라요 (무료 조건 안).\n모델: ${MODELS[s.model]?.medium ? 'V5 Full' : MODELS[s.model]?.label}\n언제든 ■ 정지할 수 있어요. 시작할까요?`;
+  const how = opt.brain === 'claude' ? `Claude(${CLAUDE_MODEL})로 평가해요` : `CLIP 그림체 유사도로 평가해요${opt.humanPick ? ' (라운드마다 멈추고 👍 고르기)' : ''}`;
+  const msg = `${opt.budget}장까지 ${queue.delay}초 간격으로 자동 생성하면서 ${how}.\n크기는 예시 비율에 맞춰 832×1216 / 1216×832 / 1024×1024 중에서 골라요 (무료 조건 안).\n모델: ${MODELS[s.model]?.medium ? 'V5 Full' : MODELS[s.model]?.label}\n언제든 ■ 정지할 수 있어요. 시작할까요?`;
   if (!confirm(msg)) return;
   const run = createRun({
     refBlob, mode: opt.mode,
@@ -137,6 +165,8 @@ async function start() {
     startNeg: opt.mode === 'current' ? s.negative : '',
     lockedPos: opt.lockedPos, lockedNeg: opt.lockedNeg,
     budget: opt.budget, batch: opt.batch, model: s.model, content: opt.content.trim(),
+    brain: opt.brain, humanPick: opt.humanPick,
+    startSettings: { scale: s.scale, cfgRescale: s.cfgRescale, steps: s.steps, sampler: s.sampler },
   });
   startRun(run);
 }
@@ -171,7 +201,24 @@ function copyCand(c, run) {
   toast('복사했어요');
 }
 
-const STATUS = { idle: '대기', analyzing: '🔍 분석 중', generating: '🎨 생성 중', judging: '🧠 Claude 평가 중', validating: '✅ 검증 중', done: '🎉 완료', stopped: '⏸ 멈춤', error: '❌ 오류' };
+const STATUS = { idle: '대기', analyzing: '🔍 분석 중', generating: '🎨 생성 중', judging: '🧠 Claude 평가 중', validating: '✅ 검증 중', picking: '👍 고르는 중', done: '🎉 완료', stopped: '⏸ 멈춤', error: '❌ 오류' };
+
+// 라운드가 끝나고 내가 고르는 화면
+function pickPanel(run) {
+  const cs = run.cands.filter((c) => c.round === run.round && c.images.length);
+  return h('div', { class: 'panel tu-pick' },
+    h('div', { class: 'row-gap tight' },
+      h('h3', {}, `👍 라운드 ${run.round}: 예시에 가까운 걸 골라주세요`),
+      h('span', { class: 'grow' }),
+      h('button', { class: 'primary', onclick: () => resolvePick(run) }, '다음 라운드 ▶')),
+    h('p', { class: 'note' }, `${run.phase || ''} · 고른 후보는 점수 보너스를 받아서 다음 후보의 중심이 돼요. 안 골라도 돼요 (CLIP 점수로 진행).`),
+    h('div', { class: 'tu-pickgrid' },
+      h('figure', { class: 'ref' }, h('img', { src: run.refUrl, onclick: () => openLightbox(run.refUrl, '예시') }), h('figcaption', {}, '예시')),
+      cs.map((c) => h('figure', { class: c.picked ? 'on' : '' },
+        h('img', { src: c.images[0].url, onclick: () => togglePick(run, c.id), title: '눌러서 👍' }),
+        h('figcaption', {}, `${c.picked ? '👍 ' : ''}${c.id} · CLIP ${c.images[0].clip.toFixed(3)}`),
+        h('div', { class: 'note tu-why' }, c.rationale)))));
+}
 
 function render() {
   const box = $('tuRight');
@@ -186,13 +233,18 @@ function render() {
   if (!run) {
     box.replaceChildren(h('div', { class: 'panel' },
       h('h3', {}, '어떻게 동작하나요?'),
+      h('h4', {}, '무료 · CLIP 자동'),
       h('ol', { class: 'note tu-steps' },
-        h('li', {}, '예시 이미지를 CLIP으로 분석해 비슷한 작가 후보 40명과 화풍 태그 힌트를 뽑아요.'),
-        h('li', {}, 'Claude가 예시를 보고 그림체를 분석하고, 비교용 내용 프롬프트와 첫 후보들을 짜요.'),
-        h('li', {}, '라운드마다 후보를 1장씩 같은 시드로 생성해요 → CLIP 점수를 매기고 → Claude가 예시와 나란히 보고 점수·지적을 남긴 뒤 다음 후보를 짜요.'),
-        h('li', {}, '초반엔 작가 조합을 넓게 탐색하고, 중반엔 가중치·화풍·퀄리티 태그, 후반엔 부정 프롬프트와 CFG·Rescale·스텝·샘플러를 다듬어요.'),
-        h('li', {}, '마지막에 상위 후보를 새 시드로 다시 그려 검증하고, 최종 메인·부정 프롬프트와 설정을 정리해요.')),
-      h('p', { class: 'note' }, '종합 점수 = Claude 점수 70% + CLIP 유사도 30%. 튜너가 만든 이미지는 히스토리에 🎛 표시로 남아요.')));
+        h('li', {}, '예시 이미지를 CLIP으로 분석해서 비슷한 작가 후보 40명, 두드러진 화풍 태그, 비교용 내용 프롬프트(인물·구도·배경)를 뽑아요.'),
+        h('li', {}, '① 작가 단독 시험: 후보 작가를 한 명씩 같은 시드로 그려서 예시와 얼마나 비슷한지 재요.'),
+        h('li', {}, '② 작가 조합·가중치: 잘 나온 작가들을 2~4명 섞고, 가중치를 올리고 내리고, 빼고 더하면서 점수가 오르는 쪽으로 진화시켜요.'),
+        h('li', {}, '③ 화풍 태그: CLIP이 찾은 화풍 태그와 V5 복잡도 태그를 하나씩 넣고 빼봐요.'),
+        h('li', {}, '④ 설정·부정 프롬프트: CFG, Rescale, 스텝, 샘플러, 부정 프롬프트 변형을 시험해요.'),
+        h('li', {}, '⑤ 상위 3개를 새 시드로 다시 그려서 우연히 잘 나온 게 아닌지 확인하고 최종 결과를 정해요.')),
+      h('p', { class: 'note' }, '"내가 👍 고르기"를 켜면 라운드마다 멈춰서, 내가 고른 후보를 중심으로 다음 후보를 만들어요. CLIP은 숫자로만 비교해서 세부를 놓칠 수 있는데, 내 눈으로 보정하는 방식이에요.'),
+      h('h4', {}, '유료 · Claude API'),
+      h('p', { class: 'note' }, 'Claude가 예시와 결과를 직접 보고 점수와 지적을 남기며 프롬프트를 고쳐요 (종합 점수 = Claude 70% + CLIP 30%). Anthropic API 키와 결제가 필요해요.'),
+      h('p', { class: 'note' }, '튜너가 만든 이미지는 히스토리에 🎛 표시로 남아요.')));
     return;
   }
   const board = leaderboard(run, 6);
@@ -206,6 +258,7 @@ function render() {
         run.error ? h('span', { class: 'bad' }, run.error) : null),
       h('div', { class: 'meter' }, h('div', { class: 'meter-fill', style: { width: pct + '%' } }))),
   ];
+  if (run.waitingPick) parts.push(pickPanel(run));
   if (run.final) parts.push(finalCard(run));
   if (run.analysis) parts.push(h('div', { class: 'panel' }, h('h3', {}, '그림체 분석'), h('p', { class: 'note pre' }, run.analysis),
     h('p', { class: 'note' }, h('b', {}, '비교용 내용 프롬프트: '), run.content)));
@@ -221,7 +274,7 @@ function render() {
           h('div', { class: 'note' }, h('b', {}, `라운드 ${r.round}`), ' · ', r.critique),
           h('div', { class: 'tu-thumbs' }, cs.map((c) => h('figure', {},
             h('img', { src: c.images[0].url, onclick: () => openLightbox(c.images[0].url, `${c.id} · Claude ${c.claude ?? '-'} · CLIP ${c.images[0].clip.toFixed(3)}\n${c.rationale}\n${c.style_prompt}`) }),
-            h('figcaption', {}, `${c.id} · ${c.claude ?? '-'}점`)))));
+            h('figcaption', {}, run.brain === 'clip' ? `${c.picked ? '👍 ' : ''}${c.id} · ${c.images[0].clip.toFixed(3)}` : `${c.id} · ${c.claude ?? '-'}점`)))));
       })));
   }
   parts.push(h('details', { class: 'panel' }, h('summary', {}, `진행 기록 (${run.log.length})`),
@@ -234,7 +287,11 @@ function candRow(run, c, s, rank) {
     h('div', { class: 'tu-rank' }, rank),
     h('div', { class: 'tu-imgs' }, c.images.slice(0, 3).map((im) => h('img', { src: im.url, onclick: () => openLightbox(im.url, `${c.id} · seed ${im.seed} · CLIP ${im.clip.toFixed(3)}`) }))),
     h('div', { class: 'tu-info' },
-      h('div', {}, h('b', {}, c.id), h('span', { class: 'note' }, ` 종합 ${s.total.toFixed(2)} · Claude ${c.claude ?? '-'} · CLIP ${s.clip != null ? s.clip.toFixed(3) : '-'}`)),
+      h('div', {}, h('b', {}, c.id),
+        h('span', { class: 'note' }, run.brain === 'clip'
+          ? ` CLIP ${s.clip != null ? s.clip.toFixed(3) : '-'} (${c.images.length}장 평균)`
+          : ` 종합 ${s.total.toFixed(2)} · Claude ${c.claude ?? '-'} · CLIP ${s.clip != null ? s.clip.toFixed(3) : '-'}`),
+        run.brain === 'clip' ? h('button', { class: 'small ghost' + (c.picked ? ' fav-on' : ''), style: { marginLeft: '6px' }, onclick: () => togglePick(run, c.id) }, c.picked ? '👍 골랐음' : '👍') : null),
       h('div', { class: 'note' }, c.note || c.rationale),
       h('code', { class: 'tu-prompt' }, c.style_prompt),
       h('div', { class: 'note' }, `부정: ${c.negative_prompt || '-'}`),
@@ -258,5 +315,7 @@ function finalCard(run) {
     h('div', { class: 'row-gap' },
       h('button', { class: 'primary', onclick: () => applyCand(f, run) }, '생성 페이지에 적용'),
       h('button', { class: 'ghost', onclick: () => copyCand(f, run) }, '전부 복사')),
-    h('p', { class: 'note' }, '최종 결과는 마지막 검증 뒤 Claude가 다듬은 버전이라 그대로 생성해 본 적은 없을 수 있어요. 적용 후 몇 장 뽑아 확인해 보세요.'));
+    h('p', { class: 'note' }, run.brain === 'claude'
+      ? '최종 결과는 마지막 검증 뒤 Claude가 다듬은 버전이라 그대로 생성해 본 적은 없을 수 있어요. 적용 후 몇 장 뽑아 확인해 보세요.'
+      : '여러 시드로 검증한 후보 그대로예요. 적용한 뒤 내용 프롬프트를 바꿔서 몇 장 뽑아 확인해 보세요.'));
 }

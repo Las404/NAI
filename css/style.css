@@ -355,6 +355,14 @@ dialog.lightbox .close { position: absolute; right: 12px; top: 12px; }
 .tu-thumbs figcaption { font-size: 10px; color: var(--muted); }
 .tu-log { max-height: 260px; overflow-y: auto; }
 .tu-final { border-color: var(--accent); }
+.tu-pick { border-color: var(--accent); }
+.tu-pickgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
+.tu-pickgrid figure { margin: 0; border: 2px solid transparent; border-radius: 10px; overflow: hidden; background: var(--panel-2); }
+.tu-pickgrid figure.on { border-color: var(--good); }
+.tu-pickgrid figure.ref { border-color: var(--accent); }
+.tu-pickgrid img { width: 100%; display: block; cursor: pointer; }
+.tu-pickgrid figcaption { font-size: 11px; padding: 4px 6px; }
+.tu-why { padding: 0 6px 6px; font-size: 10px; }
 .tu-out { margin-top: 8px; }
 
 /* 지우기·선택 */
