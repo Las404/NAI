@@ -1,13 +1,28 @@
 // 앱 전역 상태 + 변경 알림 (localStorage에 자동 저장)
 import { local } from './store.js';
 import { randSeed } from './ui.js';
+import { clampSteps } from './nai.js';
 
 export const DEFAULT_NEG =
   'lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, too many watermarks, negative space, blank page';
 
+// 튜너·기본값용 넉넉한 부정 프롬프트 (블록별로 나눠서 튜너가 켜고 끌 수 있게)
+export const NEG_BLOCKS = {
+  base: 'nsfw, lowres, worst quality, bad quality, jpeg artifacts, scan artifacts, blurry, artistic error, film grain, dithering, halftone, screentone, watermark, logo, signature, username, text, multiple views, negative space, variant set, 4koma, 2koma, turnaround, dated, upscaled, unfinished, amateur, bad illustration, bad portrait',
+  anatomy: 'mutation, deformed, distorted, disfigured, distorted anatomy, asymmetrical face, bad anatomy, bad proportions, bad hands, extra digits, fewer digits, extra limbs',
+  eyes: 'bad eyes, bad pupils, deformed pupils, extra pupils, asymmetrical eyes, mismatched eyes, dull eyes',
+  dull: '1.2::muted colors, desaturated, pale colors, washed out, low contrast, faded, dull colors::',
+  mono: 'monochrome, greyscale, sepia',
+  real: '3d, realistic',
+  rough: 'sketch, jaggy lines, oekaki, soft focus, motion blur',
+  chibi: 'chibi, toon (style)',
+  old: 'old, 1990s (style)',
+};
+export const FULL_NEG = Object.values(NEG_BLOCKS).join(', ');
+
 const defaults = {
   base: '1girl, solo, cowboy shot, looking at viewer',
-  negative: DEFAULT_NEG,
+  negative: FULL_NEG,
   quality: true,
   styleTags: [], // [{ tag, weight }]
   characters: [], // [{ prompt, uc, x, y, enabled }]  x/y: 0.1~0.9 또는 null(자동)
@@ -34,6 +49,18 @@ function migrate(s) {
     }
     delete s[k];
   }
+  absorbStyleTags(s);
+  if (s.model) s.steps = clampSteps(s.model, s.steps ?? 23);
+  return s;
+}
+
+// 화풍 태그는 이제 메인 프롬프트 글자에 바로 들어감 → 예전 목록(styleTags)은 프롬프트 앞에 합침
+export function absorbStyleTags(s) {
+  if (s.styleTags?.length) {
+    const txt = s.styleTags.map((t) => (Math.abs(t.weight - 1) < 1e-6 ? t.tag : `${t.weight}::${t.tag}::`)).join(', ');
+    s.base = [txt, (s.base || '').trim()].filter(Boolean).join(', ');
+  }
+  s.styleTags = [];
   return s;
 }
 

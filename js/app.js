@@ -9,6 +9,7 @@ import * as generate from './pages/generate.js';
 import * as artists from './pages/artists.js';
 import * as scenes from './pages/scenes.js';
 import * as tunerPage from './pages/tuner.js';
+import * as tagsPage from './pages/tags.js';
 import * as analyze from './pages/analyze.js';
 import * as lab from './pages/lab.js';
 import * as historyPage from './pages/history.js';
@@ -18,6 +19,7 @@ const PAGES = {
   '': { mod: generate, label: '🎨 생성' },
   scenes: { mod: scenes, label: '🎬 씬 모드' },
   tuner: { mod: tunerPage, label: '🎛 자동 튜너' },
+  tags: { mod: tagsPage, label: '🏷 태그 사전' },
   artists: { mod: artists, label: '🔎 작가 찾기' },
   analyze: { mod: analyze, label: '🖼️ 그림체 분석' },
   lab: { mod: lab, label: '🧪 비교 실험' },

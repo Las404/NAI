@@ -1,5 +1,5 @@
 // 생성 실행 (모든 페이지 공용): 한 번 호출 = 한 장. 동시에 하나만.
-import { MODELS, generate } from './nai.js';
+import { MODELS, generate, clampSteps } from './nai.js';
 import { buildPrompt, cloneMix } from './prompt.js';
 import { history, token } from './store.js';
 import { state, save, emit } from './state.js';
@@ -21,7 +21,7 @@ export function requestFrom(mix = state.mix, scene = null) {
     characters: (s.characters || []).filter((c) => c.enabled !== false),
     negative: join(s.negative, scene?.negative),
     width, height,
-    steps: medium ? 14 : s.steps,
+    steps: clampSteps(s.model, s.steps),
     scale: s.scale,
     cfgRescale: s.cfgRescale,
     sampler: medium ? 'k_euler_ancestral' : s.sampler,

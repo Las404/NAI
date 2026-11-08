@@ -1,8 +1,11 @@
 // 자동 그림체 튜너 엔진
 // 예시 이미지 → (Claude 분석 + CLIP 후보) → [K장 생성 → CLIP 점수 → Claude 평가·다음 후보] 반복 → 최종 프롬프트·네거티브·설정
-import { state, emit, DEFAULT_NEG } from './state.js';
-import { extractArtists, fmtWeight } from './prompt.js';
-import { MODELS, SAMPLERS } from './nai.js';
+import { state, emit, NEG_BLOCKS } from './state.js';
+import { fmtWeight } from './prompt.js';
+import { MODELS, SAMPLERS, stepRange, clampSteps } from './nai.js';
+import { imageStats, statSim, describeStats } from './imgstats.js';
+import { splitPrompt, hasTag } from './tagtext.js';
+import { loadArtists } from './artists.js';
 import { generateRaw } from './generator.js';
 import { usage, summarize } from './usage.js';
 import { history } from './store.js';
@@ -29,7 +32,8 @@ Prompt rules (NovelAI V5):
 - Quality tags belong in the main style prompt (e.g. "masterpiece, best quality, very aesthetic, absurdres") — the program does NOT add any automatically.
 - The style prompt must NOT contain subject/content tags (no 1girl, hair color, clothing, pose, background objects). Content is handled separately by CONTENT PROMPT so every candidate draws comparable content.
 - Never remove or contradict the LOCKED tags; the program always appends them.
-- Settings: scale (CFG) 3-7 typical, cfg_rescale 0-0.5, steps <= 28 (higher costs the user money), sampler from the allowed list. Lower CFG = softer/more painterly, higher = crisper/more saturated; rescale tames oversaturation at high CFG.
+- Settings: scale (CFG) 3-7 typical, cfg_rescale 0-0.5, steps: V5 models 22-25, V4.5 models 25-28 (the program clamps to this range), sampler from the allowed list.
+- The main style prompt should be complete like a pro user's: weighted artists, several style tags (coloring, contrast, line, rendering, era such as "year 2024", V5 complexity), optional negative-weighted opposites (e.g. "-1.5::flat color::"), then quality tags. The negative prompt should be thorough (quality junk, anatomy, eyes, unwanted color/style blocks), typically 60-120 tags. Lower CFG = softer/more painterly, higher = crisper/more saturated; rescale tames oversaturation at high CFG.
 
 Strategy:
 - Early rounds: explore broadly — different artist combinations (use the CLIP-suggested artists, which come from real NovelAI V5 renders of each artist, but also your own knowledge), very different weights.
@@ -43,7 +47,7 @@ Write every human-readable field (analysis, critique, notes, rationale, summary)
 const SETTINGS_PROPS = {
   scale: { type: 'number', description: 'CFG scale' },
   cfg_rescale: { type: 'number' },
-  steps: { type: 'integer', description: '<= 28' },
+  steps: { type: 'integer', description: 'V5: 22-25, V4.5: 25-28' },
   sampler: { type: 'string', enum: SAMPLERS },
 };
 const CANDIDATE = {
@@ -103,7 +107,7 @@ function sizeFor(w, h) {
   return [1024, 1024];
 }
 
-function normalizeCand(c, id, round) {
+function normalizeCand(c, id, round, model) {
   return {
     id, round,
     rationale: c.rationale || '',
@@ -111,7 +115,7 @@ function normalizeCand(c, id, round) {
     negative_prompt: (c.negative_prompt || '').trim(),
     scale: clamp(c.scale, 1, 10, 5),
     cfg_rescale: clamp(c.cfg_rescale, 0, 1, 0),
-    steps: Math.round(clamp(c.steps, 10, 28, 23)),
+    steps: clampSteps(model, c.steps),
     sampler: SAMPLERS.includes(c.sampler) ? c.sampler : 'k_euler_ancestral',
     images: [], claude: null, note: '',
   };
@@ -129,17 +133,21 @@ function requestFor(run, cand, seed) {
   };
 }
 
+// 닮음(match, 0~1) = CLIP 그림체 유사도 60% + 색감·명암·선 통계 40% (둘 다 이번 실행 안에서 0~1로 맞춤)
 // 종합 점수
-//  - Claude 두뇌: Claude 점수(0~10) 70% + CLIP 유사도(이번 실행 안에서 0~1 정규화) 30%
-//  - CLIP 두뇌: CLIP 유사도(정규화) + 내가 👍한 후보 보너스 1
+//  - Claude 두뇌: Claude 점수(0~10) 70% + 닮음 30%
+//  - CLIP 두뇌: 닮음 + 내가 👍한 후보 보너스 1
 export function scoreOf(run, cand) {
-  const clips = run.cands.flatMap((c) => c.images.map((i) => i.clip)).filter((x) => x != null);
-  const lo = Math.min(...clips), hi = Math.max(...clips);
-  const clip = cand.images.length ? cand.images.reduce((a, i) => a + i.clip, 0) / cand.images.length : null;
-  const clipN = clip == null || hi === lo ? 0.5 : (clip - lo) / (hi - lo);
-  if (run.brain === 'clip') return { total: clipN + (cand.picked ? 1 : 0), clip, clipN };
+  const imgs = run.cands.flatMap((c) => c.images);
+  const range = (k) => { const xs = imgs.map((i) => i[k]).filter((x) => x != null); return xs.length ? [Math.min(...xs), Math.max(...xs)] : [0, 0]; };
+  const avg = (k) => { const xs = cand.images.map((i) => i[k]).filter((x) => x != null); return xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null; };
+  const n01 = (v, [lo, hi]) => (v == null || hi <= lo ? 0.5 : (v - lo) / (hi - lo));
+  const clip = avg('clip'), stat = avg('stat');
+  const match = 0.6 * n01(clip, range('clip')) + 0.4 * n01(stat, range('stat'));
+  // 👍 보너스: 나중 라운드에서 고른 것일수록 조금 더 (앞선 👍를 다듬은 결과라서)
+  if (run.brain === 'clip') return { total: match + (cand.picked ? 1 + 0.03 * cand.round : 0), clip, stat, match };
   const cl = cand.claude == null ? null : cand.claude / 10;
-  return { total: cl == null ? clipN * 0.3 : cl * 0.7 + clipN * 0.3, clip, clipN };
+  return { total: cl == null ? match * 0.3 : cl * 0.7 + match * 0.3, clip, stat, match };
 }
 
 export function leaderboard(run, n = 6) {
@@ -222,6 +230,7 @@ async function analyze(run) {
   const bmp = await createImageBitmap(run.refBlob);
   [run.width, run.height] = sizeFor(bmp.width, bmp.height);
   run.refVec = await embedStyle(run.refBlob);
+  run.refStats = await imageStats(run.refBlob);
   const groups = await loadStyleGroups();
   const res = await analyzeImage(run.refBlob, { exclude: state.hidden, groups });
   const top = res.artists.slice(0, 40);
@@ -229,7 +238,9 @@ async function analyze(run) {
   run.clipHints = 'CLIP artist candidates (similarity of each artist\'s NovelAI V5 sample render to the reference, 100 = best match):\n'
     + top.map((a) => `artist:${a.tag} (${Math.round((a.sim / best) * 100)})`).join(', ')
     + '\n\nCLIP style-tag hints (z-score within group, higher = more prominent):\n'
-    + Object.entries(res.styles).map(([g, list]) => `${g}: ` + list.slice(0, 5).map((s) => `${s.tag} (${s.score.toFixed(1)})`).join(', ')).join('\n');
+    + Object.entries(res.styles).map(([g, list]) => `${g}: ` + list.slice(0, 5).map((s) => `${s.tag} (${s.score.toFixed(1)})`).join(', ')).join('\n')
+    + `\n\nMeasured color/line stats of the reference: ${describeStats(run.refStats).join(', ') || 'average'} (mean saturation ${run.refStats.meanS.toFixed(2)}, value contrast ${run.refStats.stdV.toFixed(2)}, edge density ${run.refStats.edgeD.toFixed(2)})`
+    + `\nA thorough negative prompt to start from (adapt it):\n${Object.values(NEG_BLOCKS).join(', ')}`;
   run.refImg = await blobToClaudeImage(run.refBlob, 1024);
   run.refImg.cache_control = { type: 'ephemeral' }; // 매 라운드 같은 앞부분 → 캐시
 
@@ -258,7 +269,7 @@ Task: analyze the reference style, write CONTENT_PROMPT (subject/composition/bac
   run.cost += costOf(u);
   run.analysis = data.analysis;
   if (!run.content) run.content = data.content_prompt;
-  run.pending = data.candidates.slice(0, k).map((c, i) => normalizeCand(c, `r1c${i + 1}`, 1));
+  run.pending = data.candidates.slice(0, k).map((c, i) => normalizeCand(c, `r1c${i + 1}`, 1, run.model));
   run.round = 1;
   log(`분석 완료 · 후보 ${run.pending.length}개 (Claude 비용 약 $${costOf(u).toFixed(3)})`, 'good');
 }
@@ -286,8 +297,9 @@ async function renderCands(run, cands, seedOf) {
     }
     run.used++;
     const clip = cosine(run.refVec, await embedStyle(item.blob));
-    c.images.push({ itemId: item.id, seed, clip, blob: item.blob, url: URL.createObjectURL(item.blob) });
-    log(`${c.id} 생성 (${run.used}/${run.budget}) · CLIP ${clip.toFixed(3)}`);
+    const stat = statSim(run.refStats, await imageStats(item.blob));
+    c.images.push({ itemId: item.id, seed, clip, stat, blob: item.blob, url: URL.createObjectURL(item.blob) });
+    log(`${c.id} 생성 (${run.used}/${run.budget}) · CLIP ${clip.toFixed(3)} · 색감 ${stat.toFixed(3)}`);
     await item.usageDone;
     checkLimits(run);
     if (run.used < run.budget && !run.stopping) {
@@ -312,7 +324,7 @@ async function proposeOnly(run, k) {
   });
   run.cost += costOf(u);
   run.round++;
-  run.pending = data.candidates.slice(0, k).map((c, i) => normalizeCand(c, `r${run.round}c${i + 1}`, run.round));
+  run.pending = data.candidates.slice(0, k).map((c, i) => normalizeCand(c, `r${run.round}c${i + 1}`, run.round, run.model));
 }
 
 async function loop(run) {
@@ -375,7 +387,7 @@ Task: score every candidate of round ${run.round} in "ranking" (ids: ${done.map(
     const top = leaderboard(run, 1)[0];
     log(`라운드 ${run.round}: ${data.critique} · 현재 1위 ${top?.c.id} (${top ? top.s.total.toFixed(2) : '-'}) · 누적 Claude 비용 $${run.cost.toFixed(2)}`, 'good');
     run.round++;
-    run.pending = data.candidates.slice(0, k).map((c, i) => normalizeCand(c, `r${run.round}c${i + 1}`, run.round));
+    run.pending = data.candidates.slice(0, k).map((c, i) => normalizeCand(c, `r${run.round}c${i + 1}`, run.round, run.model));
     emitT();
   }
 }
@@ -410,7 +422,7 @@ async function finish(run) {
   content.push({ type: 'text', text: `Rank these finalists by consistent style match across seeds, pick the winner, and output the FINAL reusable main style prompt (artists + style + quality tags, NO content tags — the user will add their own subject), negative prompt and settings. You may apply small final fixes you are confident about. "summary": explain in Korean what the style is and what each part of the prompt does.` });
   const { data, usage: u } = await askClaude({ system: SYSTEM, schema: FINAL_SCHEMA, content, effort: 'high' });
   run.cost += costOf(u);
-  run.final = normalizeCand(data, 'final', run.round);
+  run.final = normalizeCand(data, 'final', run.round, run.model);
   run.final.summary = data.summary;
   run.final.winner = data.winner_id;
   for (const r of data.ranking) { const c = run.cands.find((x) => x.id === r.id); if (c) c.note = r.note; }
@@ -438,16 +450,19 @@ export async function historyItemsOf(run) {
 export { ClaudeError };
 
 // ═════════════════════════ CLIP 두뇌 (무료) ═════════════════════════
-// 점수 = 예시와 생성 이미지의 CLIP 그림체 유사도. 모든 라운드가 같은 시드라 서로 비교 가능.
-// 단계: ① 작가 단독 시험 → ② 작가 조합·가중치 진화 → ③ 화풍 태그 넣고 빼기 → ④ 설정·부정 프롬프트 → ⑤ 새 시드로 검증
+// 점수 = CLIP 그림체 유사도 60% + 색감·명암·선 통계 40% (+ 내가 👍한 후보 보너스). 모든 라운드가 같은 시드라 서로 비교 가능.
+// 단계: ① 작가 단독 시험 → ② 작가 조합·가중치 → ③ 화풍 태그 → ④ 설정·부정 프롬프트 → ⑤ 새 시드로 검증
 
 let contentGroupsPromise;
 const loadContentGroups = () => (contentGroupsPromise ||= fetch(new URL('../assets/content-tags.json', import.meta.url)).then((r) => r.json()).then((j) => j.groups));
 
-// 예시 이미지 분석 (시작 전에 미리 볼 수 있게 export): 내용 프롬프트 추정 + 작가 후보 + 화풍 힌트
+// 예시 이미지 분석 (시작 전에 미리 볼 수 있게 export): 내용 프롬프트 추정 + 작가 후보 + 화풍 힌트 + 색감 통계
 export async function analyzeReference(blob) {
   const [styleGroups, contentGroups] = await Promise.all([loadStyleGroups(), loadContentGroups()]);
-  const res = await analyzeImage(blob, { exclude: state.hidden, groups: [...styleGroups, ...contentGroups] });
+  const [res, stats] = await Promise.all([
+    analyzeImage(blob, { exclude: state.hidden, groups: [...styleGroups, ...contentGroups] }),
+    imageStats(blob),
+  ]);
   const content = [];
   for (const g of contentGroups) {
     const list = res.styles[g.id];
@@ -456,84 +471,148 @@ export async function analyzeReference(blob) {
     const need = g.id === 'c_frame' ? 1.2 : ['c_clothes', 'c_bg'].includes(g.id) ? 2.1 : 1.6;
     for (const s of list.slice(0, g.pick)) if (s.score > need) content.push(s.tag);
   }
-  const styleHints = [];
+  const styleHints = [], hintDetail = [];
   for (const g of styleGroups) {
     const list = res.styles[g.id];
     if (!list) continue;
-    for (const s of list.slice(0, 2)) if (s.score > 1.2) styleHints.push(s.tag);
+    for (const s of list.slice(0, 2)) {
+      if (s.score <= 1.2 || NEVER_AUTO.has(s.tag)) continue;
+      styleHints.push(s.tag);
+      hintDetail.push({ tag: s.tag, group: g.id, score: s.score });
+    }
   }
-  return { content: content.join(', '), artists: res.artists, styleHints };
+  return { content: content.join(', '), artists: res.artists, styleHints, hintDetail, stats, statWords: describeStats(stats) };
 }
 
-const QUALITY_DEFAULT = 'masterpiece, best quality, very aesthetic, absurdres';
+// CLIP이 자주 헛짚는 태그: 자동으로는 절대 안 넣음
+const NEVER_AUTO = new Set(['ai-generated', 'abstract', 'color trace', 'calligraphy brush (medium)', 'unconventional media', 'mixed media', 'motion lines', 'motion blur', 'glitch', 'multiple views', 'photo (medium)', 'jpeg artifacts']);
+// 처음부터 넣어도 되는 분류 (나머지 힌트는 ③ 단계에서 넣어보고 점수로 판단)
+const START_GROUPS = new Set(['coloring', 'style']);
+
+export const QUALITY_DEFAULT = 'masterpiece, best quality, very aesthetic, absurdres, detailed illustration, intricate details';
+const QUALITY_SET = new Set(['masterpiece', 'best quality', 'very aesthetic', 'absurdres', 'highres', 'amazing quality', 'detailed illustration', 'intricate details', 'official art', 'high quality', 'great quality', 'good quality', 'aesthetic', 'very aesthetic']);
 const tok = (t, w) => (Math.abs(w - 1) < 1e-6 ? t : `${fmtWeight(w)}::${t}::`);
 const pickRand = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const round2 = (x) => Math.round(x * 20) / 20;
+const nrm = (t) => t.trim().toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ');
+const clone = (x) => JSON.parse(JSON.stringify(x));
+const shuffle = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
 
-function specToCand(spec, id, round, rationale) {
-  const style = join(
-    spec.artists.map((a) => tok(`artist:${a.tag}`, a.w)).join(', '),
+export function specText(spec) {
+  return join(
+    spec.artists.map((a) => tok(a.bare ? a.tag : `artist:${a.tag}`, a.w)).join(', '),
     spec.tags.map((t) => tok(t.tag, t.w)).join(', '),
     spec.extra,
+    spec.quality,
   );
+}
+
+function specToCand(spec, id, round, rationale) {
   return {
-    id, round, rationale, spec: JSON.parse(JSON.stringify(spec)),
-    style_prompt: style, negative_prompt: spec.negative,
+    id, round, rationale, spec: clone(spec),
+    style_prompt: specText(spec), negative_prompt: spec.negative,
     scale: spec.scale, cfg_rescale: spec.cfg_rescale, steps: spec.steps, sampler: spec.sampler,
     images: [], claude: null, note: '',
   };
 }
 
-const specKey = (s) => JSON.stringify([s.artists.map((a) => [a.tag, a.w]).sort(), s.tags.map((t) => [t.tag, t.w]).sort(), s.extra, s.negative, s.scale, s.cfg_rescale, s.steps, s.sampler]);
+const specKey = (s) => JSON.stringify([s.artists.map((a) => [a.tag, a.w]).sort(), s.tags.map((t) => [t.tag, t.w]).sort(), s.extra, s.quality, s.negative, s.scale, s.cfg_rescale, s.steps, s.sampler]);
+
+// 예시 특징에 맞춘 넉넉한 부정 프롬프트
+function buildNegative(stats, hints) {
+  const b = NEG_BLOCKS;
+  const has = (re) => hints.some((t) => re.test(t));
+  const parts = [b.base, b.anatomy, b.eyes];
+  if (stats.meanS > 0.25) parts.push(b.dull);
+  if (stats.meanS > 0.1) parts.push(b.mono);
+  if (!has(/realistic|3d|photo/)) parts.push(b.real);
+  if (!has(/sketch|traditional|watercolor|painterly|pencil|oekaki/)) parts.push(b.rough);
+  parts.push(b.chibi, b.old);
+  return parts.join(', ');
+}
+
+// 예시 특징 → 처음 넣을 화풍 태그
+function startStyleTags(run) {
+  const st = run.refStats;
+  const out = [];
+  const add = (tag, w = 1) => { if (!out.some((t) => nrm(t.tag) === nrm(tag))) out.push({ tag, w }); };
+  for (const d of (run.hintDetail || []).filter((x) => START_GROUPS.has(x.group) && x.score > 1.5).slice(0, 3)) add(d.tag);
+  if (st.meanS > 0.42) add('vibrant colors');
+  else if (st.meanS < 0.2 && st.meanS > 0.1) add('muted color');
+  if (st.stdV > 0.29) add('high contrast');
+  if (MODELS[run.model]?.v5) add('high complexity');
+  add('year 2024');
+  return out;
+}
+
+// 생성 페이지 프롬프트를 작가 / 화풍 태그 / 기타 / 퀄리티로 나누기
+async function parseStart(run, text) {
+  const known = new Set((await loadArtists()).map((a) => nrm(a.tag)));
+  const styleSet = new Set((await loadStyleGroups()).flatMap((g) => g.tags.map(([t]) => nrm(t))));
+  const spec = { artists: [], tags: [], extra: '', quality: '' };
+  const extra = [], quality = [];
+  for (const t of splitPrompt(text)) {
+    const key = nrm(t.tag);
+    if (run.lockedPos && hasTag(run.lockedPos, t.tag)) continue;
+    if (t.artist) spec.artists.push({ tag: t.tag.replace(/^artist:\s*/i, ''), w: t.weight });
+    else if (t.weight > 0 && known.has(key)) spec.artists.push({ tag: t.tag, w: t.weight, bare: true });
+    else if (QUALITY_SET.has(key) && Math.abs(t.weight - 1) < 1e-6) quality.push(t.tag);
+    else if (styleSet.has(key) || /^year \d{4}$|complexity$|^meta:/.test(key)) spec.tags.push({ tag: t.tag, w: t.weight });
+    else extra.push(tok(t.tag, t.weight));
+  }
+  spec.extra = extra.join(', ');
+  spec.quality = quality.join(', ') || QUALITY_DEFAULT;
+  return spec;
+}
 
 async function clipAnalyze(run) {
   run.status = 'analyzing';
-  log('예시 이미지 분석 중 (CLIP)…');
+  log('예시 이미지 분석 중 (CLIP + 색감·선 통계)…');
   const bmp = await createImageBitmap(run.refBlob);
   [run.width, run.height] = sizeFor(bmp.width, bmp.height);
   run.refVec = await embedStyle(run.refBlob);
   const ref = await analyzeReference(run.refBlob);
+  run.refStats = ref.stats;
   if (!run.content) run.content = ref.content;
-  run.artistPool = ref.artists.slice(0, 40).map((a) => a.tag);
+  run.artistPool = ref.artists.slice(0, 48).map((a) => a.tag);
   run.styleHints = ref.styleHints;
-  run.analysis = `CLIP 추정 — 비슷한 작가: ${run.artistPool.slice(0, 8).join(', ')} … / 두드러진 화풍: ${ref.styleHints.join(', ') || '없음'}`;
+  run.hintDetail = ref.hintDetail;
+  run.analysis = `비슷한 작가 (CLIP): ${run.artistPool.slice(0, 8).join(', ')} …\n두드러진 화풍 (CLIP): ${ref.styleHints.join(', ') || '없음'}\n색감·선: ${ref.statWords.join(', ') || '보통'} (채도 ${ref.stats.meanS.toFixed(2)} · 대비 ${ref.stats.stdV.toFixed(2)} · 윤곽 ${ref.stats.edgeD.toFixed(2)})`;
 
-  // 출발 스펙
+  const [lo, hi] = stepRange(run.model);
+  const st = run.startSettings || {};
+  const settings = run.mode === 'current'
+    ? { scale: clamp(st.scale, 1, 10, 5), cfg_rescale: clamp(st.cfgRescale, 0, 1, 0), steps: clampSteps(run.model, st.steps), sampler: SAMPLERS.includes(st.sampler) ? st.sampler : 'k_euler_ancestral' }
+    : { scale: 5, cfg_rescale: 0.1, steps: Math.round((lo + hi) / 2), sampler: 'k_euler_ancestral' };
   if (run.mode === 'current') {
-    const { mix, rest } = extractArtists(run.startPos || '');
-    const st = run.startSettings || {};
-    run.base = {
-      artists: mix.map((a) => ({ tag: a.tag, w: a.weight })), tags: [], extra: rest || QUALITY_DEFAULT,
-      negative: run.startNeg || DEFAULT_NEG,
-      scale: clamp(st.scale, 1, 10, 5), cfg_rescale: clamp(st.cfgRescale, 0, 1, 0), steps: Math.round(clamp(st.steps, 10, 28, 28)),
-      sampler: SAMPLERS.includes(st.sampler) ? st.sampler : 'k_euler_ancestral',
-    };
+    const parsed = await parseStart(run, run.startPos || '');
+    run.base = { ...parsed, negative: run.startNeg || buildNegative(run.refStats, run.styleHints), ...settings };
+    if (!parsed.tags.length) run.base.tags = startStyleTags(run);
   } else {
-    run.base = { artists: [], tags: [], extra: QUALITY_DEFAULT, negative: DEFAULT_NEG, scale: 5, cfg_rescale: 0, steps: 28, sampler: 'k_euler_ancestral' };
+    run.base = { artists: [], tags: startStyleTags(run), extra: '', quality: QUALITY_DEFAULT, negative: buildNegative(run.refStats, run.styleHints), ...settings };
   }
   run.seen = new Set();
-  run.screened = []; // 작가 단독 점수 [{ tag, clip }]
+  run.screened = []; // 작가 단독 점수 [{ tag, score }]
   const reserve = run.budget >= 30 ? Math.min(6, Math.floor(run.budget * 0.1)) : 0;
   const avail = run.budget - reserve;
-  run.plan = {
-    reserve,
-    screen: Math.max(run.batch, Math.round(avail * 0.3)),
-    mix: Math.round(avail * 0.35),
-    tags: Math.round(avail * 0.15),
-  };
+  // 단계별 몫을 라운드(후보 수) 단위로 맞춤 → 작은 예산에서도 ①~④가 다 돌아감
+  const rounds = (share) => Math.max(1, Math.round((avail * share) / run.batch)) * run.batch;
+  run.plan = { reserve, screen: rounds(0.3), mix: rounds(0.3), tags: rounds(0.2) };
   run.round = 0;
-  log(`분석 완료 · 내용 프롬프트: ${run.content}`, 'good');
+  log(`분석 완료 · 내용 프롬프트: ${run.content || '(없음)'}`, 'good');
 }
 
 function bestSpec(run) {
   const top = leaderboard(run, 1)[0];
-  return top?.c.spec ? JSON.parse(JSON.stringify(top.c.spec)) : JSON.parse(JSON.stringify(run.base));
+  return clone(top?.c.spec || run.base);
 }
 
 // 현재 단계에 맞는 후보 k개 만들기
 function nextBatch(run, k) {
   const used = run.used;
   const { screen, mix, tags } = run.plan;
+  // 이번 단계 남은 몫만큼만 (다음 단계로 넘치지 않게)
+  for (const end of [screen, screen + mix, screen + mix + tags]) if (used < end) { k = Math.min(k, end - used); break; }
   const out = [];
   const push = (spec, why) => {
     const key = specKey(spec);
@@ -545,24 +624,24 @@ function nextBatch(run, k) {
 
   if (used < screen) {
     run.phase = '① 작가 단독 시험';
-    if (!run.cands.length && base.artists.length) push(JSON.parse(JSON.stringify(base)), '출발점 (지금 프롬프트)');
+    if (!run.cands.length && base.artists.length) push(clone(base), '출발점 (지금 프롬프트)');
     const tried = new Set(run.screened.map((s) => s.tag));
     for (const tag of run.artistPool) {
       if (out.length >= k) break;
       if (tried.has(tag)) continue;
-      push({ ...JSON.parse(JSON.stringify(base)), artists: [{ tag, w: 1 }] }, `작가 단독: ${tag}`);
+      push({ ...clone(base), artists: [{ tag, w: 1 }] }, `작가 단독: ${tag}`);
     }
     if (out.length) return out;
   }
-  const topArtists = run.screened.slice().sort((a, b) => b.clip - a.clip).slice(0, 6).map((s) => s.tag);
+  const topArtists = run.screened.map((s) => ({ tag: s.tag, score: scoreOf(run, s.cand).total })).sort((a, b) => b.score - a.score).slice(0, 6).map((s) => s.tag);
   if (used < screen + mix && topArtists.length) {
     run.phase = '② 작가 조합·가중치';
     const best = bestSpec(run);
     let guard = 0;
-    while (out.length < k && guard++ < 200) {
+    while (out.length < k && guard++ < 300) {
       const r = Math.random();
       if (r < 0.4 || best.artists.length < 2) {
-        // 새 조합: 상위 작가 2~4명, 가중치 0.4~1.2
+        // 새 조합: 상위 작가 2~4명, 가중치 0.4~1.2 (1위에 가까울수록 무겁게)
         const n = 2 + Math.floor(Math.random() * 3);
         const pool = topArtists.slice();
         const artists = [];
@@ -572,16 +651,14 @@ function nextBatch(run, k) {
         }
         push({ ...best, artists }, `새 조합 ${artists.map((a) => a.tag).join(' + ')}`);
       } else {
-        // 최고 후보 변형: 가중치 조정 / 한 명 빼기 / 한 명 추가
-        const s = JSON.parse(JSON.stringify(best));
+        const s = clone(best);
         const m = Math.random();
         if (m < 0.55) {
           const a = pickRand(s.artists);
           a.w = round2(clamp(a.w + pickRand([-0.3, -0.2, -0.1, 0.1, 0.2, 0.3]), 0.2, 1.5, 1));
           push(s, `가중치 조정 ${a.tag} → ${a.w}`);
         } else if (m < 0.75 && s.artists.length > 1) {
-          const i = Math.floor(Math.random() * s.artists.length);
-          const [gone] = s.artists.splice(i, 1);
+          const [gone] = s.artists.splice(Math.floor(Math.random() * s.artists.length), 1);
           push(s, `빼보기 ${gone.tag}`);
         } else {
           const cand = topArtists.filter((t) => !s.artists.some((a) => a.tag === t));
@@ -598,28 +675,46 @@ function nextBatch(run, k) {
   if (used < screen + mix + tags) {
     run.phase = '③ 화풍 태그';
     const best = bestSpec(run);
-    const hints = [...(run.styleHints || []), 'high complexity', 'ultra complexity', 'depthness', 'meta:golden era'];
-    for (const tag of hints) {
-      if (best.tags.some((t) => t.tag === tag) || best.extra.includes(tag)) continue;
-      push({ ...best, tags: [...best.tags, { tag, w: 1 }] }, `태그 더하기: ${tag}`);
-      push({ ...best, tags: [...best.tags, { tag, w: 1.3 }] }, `태그 강하게: ${tag}`);
+    const st = run.refStats;
+    const inBest = (tag) => best.tags.some((t) => nrm(t.tag) === nrm(tag)) || hasTag(best.extra, tag);
+    const ideas = [];
+    const add = (tag, w, why) => { if (!inBest(tag)) ideas.push([{ ...best, tags: [...best.tags, { tag, w }] }, why]); };
+    for (const tag of run.styleHints || []) add(tag, 1, `태그 더하기: ${tag}`);
+    const extraIdeas = ['anime coloring', 'soft line', 'ligne claire', 'detailed hair', 'shiny skin', 'rim light', 'depthness', 'year 2025', 'year 2022'];
+    if (MODELS[run.model]?.v5) extraIdeas.push('ultra complexity', 'meta:golden era');
+    if (st.meanS > 0.35) { add('vibrant colors', 1.2, '선명한 색 강조'); ideas.push([{ ...best, tags: [...best.tags, { tag: 'flat color', w: -1.5 }] }, '단색 채색 밀어내기 (-1.5)']); }
+    if (st.meanS < 0.22) add('pastel colors', 1, '파스텔 색');
+    if (st.stdV > 0.27) add('high contrast', 1.2, '대비 강조');
+    for (const tag of extraIdeas) add(tag, 1, `태그 더하기: ${tag}`);
+    for (const t of best.tags) {
+      ideas.push([{ ...best, tags: best.tags.filter((x) => x !== t) }, `태그 빼기: ${t.tag}`]);
+      if (t.w > 0) ideas.push([{ ...best, tags: best.tags.map((x) => (x === t ? { ...x, w: round2(Math.min(2, x.w * 1.3)) } : x)) }, `태그 강하게: ${t.tag}`]);
     }
-    for (const t of best.tags) push({ ...best, tags: best.tags.filter((x) => x !== t) }, `태그 빼기: ${t.tag}`);
+    for (const [s, why] of shuffle(ideas)) push(s, why);
     if (out.length) return out.slice(0, k);
   }
   run.phase = '④ 설정·부정 프롬프트';
   const best = bestSpec(run);
+  const [lo, hi] = stepRange(run.model);
   const variants = [
     { scale: round2(best.scale - 1) }, { scale: round2(best.scale + 1) }, { scale: round2(best.scale - 0.5) }, { scale: round2(best.scale + 0.5) },
     { cfg_rescale: 0 }, { cfg_rescale: 0.2 }, { cfg_rescale: 0.4 },
-    { steps: best.steps === 28 ? 23 : 28 },
     { sampler: 'k_euler_ancestral' }, { sampler: 'k_dpmpp_2m_sde' }, { sampler: 'k_euler' }, { sampler: 'k_dpmpp_2s_ancestral' },
-    { negative: DEFAULT_NEG }, { negative: run.startNeg || DEFAULT_NEG }, { negative: join(best.negative, 'monochrome, greyscale, sketch') },
   ];
-  for (const v of variants.sort(() => Math.random() - 0.5)) {
-    const s = { ...best, ...v };
+  for (let s = lo; s <= hi; s++) if (s !== best.steps) variants.push({ steps: s });
+  // 부정 프롬프트 묶음 켜고 끄기
+  for (const [key, block] of Object.entries(NEG_BLOCKS)) {
+    if (key === 'base') continue;
+    variants.push(best.negative.includes(block)
+      ? { negative: best.negative.replace(block, '').replace(/,\s*,/g, ',').replace(/^,\s*|,\s*$/g, '').trim(), _why: `부정에서 빼기: ${key}` }
+      : { negative: join(best.negative, block), _why: `부정에 더하기: ${key}` });
+  }
+  for (const v of shuffle(variants)) {
+    const { _why, ...vv } = v;
+    const s = { ...best, ...vv };
     s.scale = clamp(s.scale, 2, 9, 5);
-    push(s, '설정 ' + Object.entries(v).map(([a, b]) => `${a}=${typeof b === 'string' && b.length > 20 ? b.slice(0, 20) + '…' : b}`).join(', '));
+    s.steps = clampSteps(run.model, s.steps);
+    push(s, _why || '설정 ' + Object.entries(vv).map(([a, b]) => `${a}=${b}`).join(', '));
   }
   return out;
 }
@@ -640,8 +735,6 @@ async function clipLoop(run) {
     run.status = 'generating';
     emitT();
     await renderCands(run, cands, () => seed);
-    // 작가 단독 결과 기록
-    for (const c of cands) if (c.images.length && c.spec.artists.length === 1 && c.rationale.includes('작가 단독')) run.screened.push({ tag: c.spec.artists[0].tag, clip: c.images[0].clip });
     if (run.stopping) {
       const undone = cands.filter((c) => !c.images.length);
       run.cands = run.cands.filter((c) => !undone.includes(c));
@@ -649,18 +742,21 @@ async function clipLoop(run) {
       run.pending = undone;
       break;
     }
-    const top = leaderboard(run, 1)[0];
-    run.rounds.push({ round: run.round, critique: `${run.phase} — 이번 라운드 최고 CLIP ${Math.max(...cands.filter((c) => c.images.length).map((c) => c.images[0].clip)).toFixed(3)}` });
-    log(`라운드 ${run.round} (${run.phase}) 끝 · 현재 1위 ${top?.c.id} CLIP ${top?.s.clip?.toFixed(3)}`, 'good');
     if (run.humanPick && run.budget - run.plan.reserve - run.used > 0) {
       run.status = 'picking';
       run.waitingPick = true;
-      log('👍 마음에 드는 이미지를 고르고 "다음 라운드"를 눌러주세요');
+      log('👍 예시에 가까운 이미지를 고르고 "다음 라운드"를 눌러주세요');
       emitT();
       await new Promise((res) => { run.pickResolve = res; });
       run.pickResolve = null;
       run.waitingPick = false;
     }
+    // 작가 단독 결과 기록 (점수는 쓸 때마다 다시 계산: 👍·정규화 반영)
+    for (const c of cands) if (c.images.length && c.rationale.includes('작가 단독')) run.screened.push({ tag: c.spec.artists[0].tag, cand: c });
+    const top = leaderboard(run, 1)[0];
+    const bestNow = Math.max(...cands.filter((c) => c.images.length).map((c) => scoreOf(run, c).match));
+    run.rounds.push({ round: run.round, critique: `${run.phase} — 이번 라운드 최고 닮음 ${Math.round(bestNow * 100)}` });
+    log(`라운드 ${run.round} (${run.phase}) 끝 · 현재 1위 ${top?.c.id}`, 'good');
   }
 }
 
@@ -689,17 +785,16 @@ async function clipFinish(run) {
     }
   }
   if (run.stopping) return;
-  // 여러 시드 평균이 가장 높은 후보 (👍 우선)
-  const ranked = leaderboard(run, 3);
+  // 우승은 검증한 후보(여러 시드 평균) 중에서만 — 1장만 운 좋게 잘 나온 후보가 이기지 않게
+  const ranked = board.map(({ c }) => ({ c, s: scoreOf(run, c) })).sort((a, b) => b.s.total - a.s.total);
   const win = ranked[0].c;
   run.final = { ...win, id: 'final', winner: win.id };
   const sp = win.spec;
   run.final.summary = [
-    `우승 ${win.id} (CLIP 평균 ${ranked[0].s.clip.toFixed(3)}, ${win.images.length}장 기준${win.picked ? ', 👍 선택' : ''})`,
+    `우승 ${win.id} · 닮음 ${Math.round(ranked[0].s.match * 100)} (${win.images.length}장 평균${win.picked ? ', 👍 선택' : ''})`,
     `작가: ${sp.artists.map((a) => `${a.tag}${a.w !== 1 ? ' ×' + a.w : ''}`).join(', ') || '없음'}`,
-    sp.tags.length ? `더한 화풍 태그: ${sp.tags.map((t) => t.tag).join(', ')}` : null,
+    sp.tags.length ? `화풍 태그: ${sp.tags.map((t) => tok(t.tag, t.w)).join(', ')}` : null,
     `설정: CFG ${sp.scale} · Rescale ${sp.cfg_rescale} · ${sp.steps}스텝 · ${sp.sampler}`,
-    'CLIP은 그림체를 숫자로만 비교해서, 눈매나 선 굵기 같은 세부는 놓칠 수 있어요. 결과를 보고 👍 고르기나 비교 실험으로 다듬어 보세요.',
   ].filter(Boolean).join('\n');
   run.status = 'done';
   log(`완료! 우승 ${win.id} · 생성 ${run.used}장`, 'good');

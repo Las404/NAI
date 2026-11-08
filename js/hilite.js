@@ -36,11 +36,18 @@ export function highlight(text) {
 }
 
 // textarea를 색 표시 입력칸으로 감싸서 반환 (textarea 자체는 그대로 쓰면 됨)
-export function hiliteBox(textarea) {
+// opts.grow: [최소px, 최대px] 이면 글 길이에 맞춰 높이가 늘어남
+export function hiliteBox(textarea, opts = {}) {
   textarea.classList.add('hl-front');
   const back = h('div', { class: 'hl-back', 'aria-hidden': 'true' });
-  const wrap = h('div', { class: 'hl-wrap' }, back, textarea);
-  const sync = () => { back.innerHTML = highlight(textarea.value); back.scrollTop = textarea.scrollTop; };
+  const wrap = h('div', { class: 'hl-wrap' + (opts.grow ? ' grow-box' : '') }, back, textarea);
+  const grow = () => {
+    if (!opts.grow || !textarea.isConnected || !textarea.offsetParent) return;
+    const [lo, hi] = opts.grow;
+    textarea.style.height = 'auto';
+    textarea.style.height = Math.min(hi, Math.max(lo, textarea.scrollHeight + 2)) + 'px';
+  };
+  const sync = () => { grow(); back.innerHTML = highlight(textarea.value); back.scrollTop = textarea.scrollTop; };
   textarea.addEventListener('input', sync);
   textarea.addEventListener('scroll', () => { back.scrollTop = textarea.scrollTop; });
   new ResizeObserver(() => { back.style.height = textarea.offsetHeight + 'px'; sync(); }).observe(textarea);

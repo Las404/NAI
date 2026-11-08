@@ -5,6 +5,7 @@ import { imageUrl } from '../artists.js';
 import { fmtWeight, cloneMix } from '../prompt.js';
 import { loadEngine, analyzeImage, hasClipData } from '../clip.js';
 import { loadStyleGroups, toggleStyleTag } from '../stylepicker.js';
+import { splitPrompt } from '../tagtext.js';
 import { mixBar } from '../mixbar.js';
 
 let result = null;
@@ -137,7 +138,7 @@ async function renderStyles() {
   const box = $('anStyles');
   if (!box || !result) return;
   const groups = await loadStyleGroups();
-  const selected = new Set(state.settings.styleTags.map((t) => t.tag));
+  const selected = new Set(splitPrompt(state.settings.base).map((t) => t.tag));
   const rows = groups.filter((g) => result.styles[g.id]).map((g) => {
     const top = result.styles[g.id].filter((s) => s.score > 1.0).slice(0, 3);
     return h('div', { class: 'style-row' },

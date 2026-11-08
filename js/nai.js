@@ -20,6 +20,17 @@ export const QUALITY_SUFFIX = {
   'nai-diffusion-4-5-curated': ', location, masterpiece, no text, -0.8::feet::, rating:general',
 };
 
+// 모델별 스텝 범위 (V5 22~25, V4.5 25~28). Medium effort는 14 고정.
+export function stepRange(model) {
+  if (MODELS[model]?.medium) return [14, 14];
+  return MODELS[model]?.v5 ? [22, 25] : [25, 28];
+}
+export function clampSteps(model, steps) {
+  const [lo, hi] = stepRange(model);
+  const n = Math.round(Number(steps));
+  return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : Math.round((lo + hi) / 2);
+}
+
 export const SAMPLERS = ['k_euler_ancestral', 'k_euler', 'k_dpmpp_2s_ancestral', 'k_dpmpp_2m_sde', 'k_dpmpp_2m', 'k_dpmpp_sde'];
 
 // Opus 무료 생성 조건: 1장, txt2img, 1024x1024 픽셀 이하, 28스텝 이하
@@ -31,7 +42,7 @@ export function buildBody(s) {
   const model = s.model;
   const medium = !!MODELS[model]?.medium;
   const v5 = !!MODELS[model]?.v5;
-  const steps = medium ? 14 : s.steps;
+  const steps = clampSteps(model, s.steps);
   const sampler = medium ? 'k_euler_ancestral' : s.sampler;
   const negative = medium ? '' : s.negative;
 
