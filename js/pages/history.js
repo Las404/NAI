@@ -4,7 +4,7 @@ import { state, save, on } from '../state.js';
 import { MODELS } from '../nai.js';
 import { mixLabel, cloneMix } from '../prompt.js';
 import { history } from '../store.js';
-import { deleteItems } from '../remove.js';
+import { deleteItems, quickDelete } from '../remove.js';
 
 const urls = new Map();
 const filter = { fav: false, q: '' };
@@ -25,10 +25,13 @@ export function mount(el) {
       h('span', { class: 'sep' }),
       h('button', { class: 'ghost small danger', onclick: delNonFav }, '🗑 즐겨찾기 아닌 것 모두 삭제'),
       h('button', { class: 'ghost small danger', onclick: () => deleteItems(allRows, { title: `생성 기록 ${allRows.length}장을 전부 지울까요?` }) }, '🗑 전체 삭제'),
+      h('label', { class: 'inline', title: '한 장씩 지울 때 확인 창 없이 바로 지워요 (컴퓨터 파일 포함)' },
+        h('input', { type: 'checkbox', id: 'hQuick', checked: quickDelete.on, onchange: (e) => { quickDelete.on = e.target.checked; } }), '한 장은 묻지 않고 바로 지우기'),
       h('span', { class: 'note' }, '카드를 Ctrl+클릭하거나 ☐를 눌러 여러 장을 고를 수 있어요.')),
     h('div', { id: 'hGrid', class: 'grid' }),
   );
   on('generated', () => { if (location.hash.startsWith('#/history')) render(); });
+  on('quickDelete', () => { $('hQuick').checked = quickDelete.on; });
   on('deleted', ({ ids }) => {
     for (const id of ids) { selected.delete(id); if (urls.has(id)) { URL.revokeObjectURL(urls.get(id)); urls.delete(id); } }
     if (location.hash.startsWith('#/history')) render();
